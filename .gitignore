@@ -43,6 +43,9 @@ storage/
 results_*
 .pytest_cache/
 .coverage
+DEPLOYMENT.md
+DOCUMENTATION.txt
+.env.example
 
 # Railway
 .railway/
