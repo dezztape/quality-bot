@@ -98,6 +98,12 @@ else:
 # DATABASE
 # =========================
 
+# Преобразуем DATABASE_URL для asyncpg если нужно
+# Railway отправляет postgresql://, нам нужен postgresql+asyncpg://
+if DATABASE_URL and "postgresql+asyncpg" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+    logger.info("🔄 Converted DATABASE_URL to use asyncpg")
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
