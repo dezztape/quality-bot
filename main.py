@@ -71,8 +71,13 @@ ADMIN_IDS = [
     for x in os.getenv("ADMIN_IDS", "").split(",")
     if x
 ]
+MODERATOR_IDS = [
+    int(x)
+    for x in os.getenv("MODERATOR_IDS", "").split(",")
+    if x
+]
 
-logger.info(f"✅ Loaded {len(ADMIN_IDS)} admin(s)")
+logger.info(f"✅ Loaded {len(ADMIN_IDS)} admin(s) and {len(MODERATOR_IDS)} moderator(s)")
 
 
 # =========================
@@ -297,6 +302,15 @@ user_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+moderator_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📝 Пройти тест")],
+        [KeyboardButton(text="➕ Добавить вопрос")],
+        [KeyboardButton(text="👀 Просмотреть тест")],
+    ],
+    resize_keyboard=True,
+)
+
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Пройти тест")],
@@ -327,6 +341,14 @@ async def create_db():
 
 async def is_admin(user_id: int):
     return user_id in ADMIN_IDS
+
+
+async def is_moderator(user_id: int):
+    return user_id in MODERATOR_IDS
+
+
+async def is_admin_or_moderator(user_id: int):
+    return user_id in ADMIN_IDS or user_id in MODERATOR_IDS
 
 
 async def get_user_by_tg_id(
@@ -453,17 +475,19 @@ async def start_handler(message: Message, state: FSMContext):
         if (
             not user.is_whitelisted
             and message.from_user.id not in ADMIN_IDS
+            and message.from_user.id not in MODERATOR_IDS
         ):
             await message.answer(
                 "⛔ У вас нет доступа"
             )
             return
 
-        keyboard = (
-            admin_keyboard
-            if message.from_user.id in ADMIN_IDS
-            else user_keyboard
-        )
+        if message.from_user.id in ADMIN_IDS:
+            keyboard = admin_keyboard
+        elif message.from_user.id in MODERATOR_IDS:
+            keyboard = moderator_keyboard
+        else:
+            keyboard = user_keyboard
 
         await message.answer(
             "✅ Добро пожаловать",
@@ -764,7 +788,7 @@ async def add_question_start(
     state: FSMContext,
 ):
 
-    if not await is_admin(message.from_user.id):
+    if not await is_admin_or_moderator(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
 
@@ -1211,7 +1235,7 @@ async def send_question(
 @dp.message(F.text == "👀 Просмотреть тест")
 async def view_test_button(message: Message, state: FSMContext):
     
-    if not await is_admin(message.from_user.id):
+    if not await is_admin_or_moderator(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
 
@@ -1283,7 +1307,7 @@ async def admin_view_question(
     callback: CallbackQuery
 ):
 
-    if not await is_admin(callback.from_user.id):
+    if not await is_admin_or_moderator(callback.from_user.id):
         return
 
     question_id = int(
