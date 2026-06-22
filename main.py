@@ -264,6 +264,7 @@ class QuestionAddStates(StatesGroup):
     choosing_test_type = State()
     waiting_photo = State()
     waiting_answer = State()
+    confirming_question = State()
 
 
 class UserRegistrationStates(StatesGroup):
@@ -306,7 +307,6 @@ moderator_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Пройти тест")],
         [KeyboardButton(text="➕ Добавить вопрос")],
-        [KeyboardButton(text="👀 Просмотреть тест")],
     ],
     resize_keyboard=True,
 )
@@ -846,6 +846,56 @@ async def handle_add_test_type(callback: CallbackQuery, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data.startswith("confirm_question:"))
+async def handle_confirm_question(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":")[1]
+    
+    await callback.answer()
+    await callback.message.delete()
+    
+    data = await state.get_data()
+    
+    if action == "no":
+        # Переснять - возвращаемся к выбору фото
+        await state.set_state(QuestionAddStates.waiting_photo)
+        msg = await callback.message.answer(
+            "📷 Отправьте новое изображение"
+        )
+        await state.update_data(
+            instruction_message_id=msg.message_id
+        )
+        return
+    
+    # action == "yes" - подтверждаем и сохраняем вопрос
+    async with async_session() as session:
+        result = await session.execute(
+            select(Question).where(
+                Question.test_id == data["test_id"],
+                Question.test_type == data.get("question_test_type", "control"),
+            )
+        )
+        
+        questions = result.scalars().all()
+        next_order = len(questions) + 1
+        
+        question = Question(
+            test_id=data["test_id"],
+            test_type=data.get("question_test_type", "control"),
+            question_order=next_order,
+            image_file_id=data["photo_id"],
+            correct_answer=data["correct_answer"],
+        )
+        
+        session.add(question)
+        await session.commit()
+    
+    await state.clear()
+    
+    await callback.message.answer(
+        "✅ Вопрос сохранён"
+    )
+
+
 # =========================
 # PHOTO HANDLER
 # =========================
@@ -1235,7 +1285,7 @@ async def send_question(
 @dp.message(F.text == "👀 Просмотреть тест")
 async def view_test_button(message: Message, state: FSMContext):
     
-    if not await is_admin_or_moderator(message.from_user.id):
+    if not await is_admin(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
 
@@ -1942,36 +1992,13 @@ async def text_handler(
             return
 
         data = await state.get_data()
-
-        async with async_session() as session:
-
-            result = await session.execute(
-                select(Question).where(
-                    Question.test_id == data["test_id"],
-                    Question.test_type == data.get("question_test_type", "control"),
-                )
-            )
-
-            questions = result.scalars().all()
-
-            next_order = len(questions) + 1
-
-            question = Question(
-                test_id=data["test_id"],
-                test_type=data.get("question_test_type", "control"),
-                question_order=next_order,
-                image_file_id=data["photo_id"],
-                correct_answer=answer,
-            )
-
-            session.add(question)
-
-            await session.commit()
-
-        await state.clear()
-
+        
+        # Сохраняем ответ в state и переходим на подтверждение
+        await state.update_data(correct_answer=answer)
+        await state.set_state(QuestionAddStates.confirming_question)
+        
         await message.delete()
-
+        
         # Удаляем инструкционное сообщение
         if data.get("instruction_message_id"):
             try:
@@ -1981,9 +2008,19 @@ async def text_handler(
                 )
             except:
                 pass
-
-        await message.answer(
-            "✅ Вопрос сохранён"
+        
+        # Показываем превью вопроса с фото и ответом
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Подтвердить", callback_data="confirm_question:yes")
+        kb.button(text="❌ Переснять", callback_data="confirm_question:no")
+        kb.adjust(2)
+        
+        await message.answer_photo(
+            photo=data["photo_id"],
+            caption=f"📋 Правильный ответ: <b>{answer}</b>\n\n"
+                   f"Всё правильно?",
+            reply_markup=kb.as_markup(),
+            parse_mode=ParseMode.HTML
         )
 
         return
