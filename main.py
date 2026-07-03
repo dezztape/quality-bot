@@ -1,8 +1,8 @@
 import asyncio
 import os
 import logging
-from datetime import date
-from typing import Dict
+from datetime import date, datetime, timezone
+from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -22,6 +22,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
+    BotCommand,
     FSInputFile,
     ReplyKeyboardMarkup,
     KeyboardButton,
@@ -32,12 +33,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
+    DateTime,
     ForeignKey,
     Integer,
     String,
+    UniqueConstraint,
+    func,
+    text,
     select,
-    delete,
 )
 
 from sqlalchemy.ext.asyncio import (
@@ -46,7 +51,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 # =========================
@@ -103,6 +108,9 @@ else:
 # DATABASE
 # =========================
 
+DB_SCHEMA = "quality_bot"
+INIT_SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "init_schema.sql"
+
 # Преобразуем DATABASE_URL для asyncpg если нужно
 # Railway отправляет postgresql://, нам нужен postgresql+asyncpg://
 if DATABASE_URL and "postgresql+asyncpg" not in DATABASE_URL:
@@ -130,8 +138,9 @@ class Base(DeclarativeBase):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = {"schema": DB_SCHEMA}
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
     telegram_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -152,11 +161,34 @@ class User(Base):
         default=False,
     )
 
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    sessions: Mapped[list["TestSession"]] = relationship(
+        back_populates="user"
+    )
+
+    answers: Mapped[list["Answer"]] = relationship(
+        back_populates="user"
+    )
+
 
 class Test(Base):
     __tablename__ = "tests"
+    __table_args__ = (
+        UniqueConstraint("test_date", name="uq_quality_bot_tests_test_date"),
+        {"schema": DB_SCHEMA},
+    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
     title: Mapped[str] = mapped_column(
         String(255)
@@ -176,14 +208,48 @@ class Test(Base):
         default=False,
     )
 
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    questions: Mapped[list["Question"]] = relationship(
+        back_populates="test"
+    )
+
+    sessions: Mapped[list["TestSession"]] = relationship(
+        back_populates="test"
+    )
+
 
 class Question(Base):
     __tablename__ = "questions"
+    __table_args__ = (
+        UniqueConstraint(
+            "test_id",
+            "test_type",
+            "question_order",
+            name="uq_quality_bot_questions_order",
+        ),
+        {"schema": DB_SCHEMA},
+    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
     test_id: Mapped[int] = mapped_column(
-        ForeignKey("tests.id")
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.tests.id")
     )
 
     test_type: Mapped[str] = mapped_column(
@@ -203,36 +269,106 @@ class Question(Base):
         Integer
     )
 
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    test: Mapped["Test"] = relationship(
+        back_populates="questions"
+    )
+
+    answers: Mapped[list["Answer"]] = relationship(
+        back_populates="question"
+    )
+
 
 class Answer(Base):
     __tablename__ = "answers"
+    __table_args__ = (
+        UniqueConstraint(
+            "attempt_id",
+            "question_id",
+            name="uq_quality_bot_answers_attempt_question",
+        ),
+        {"schema": DB_SCHEMA},
+    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+    attempt_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.test_attempts.id")
+    )
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id")
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.users.id")
     )
 
     question_id: Mapped[int] = mapped_column(
-        ForeignKey("questions.id")
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.questions.id")
     )
 
     answer: Mapped[int] = mapped_column(
         Integer
     )
 
+    is_correct: Mapped[bool] = mapped_column(
+        Boolean
+    )
+
+    correct_answer_at_time: Mapped[int] = mapped_column(
+        Integer
+    )
+
+    answered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    attempt: Mapped["TestAttempt"] = relationship(
+        back_populates="answers"
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="answers"
+    )
+
+    question: Mapped["Question"] = relationship(
+        back_populates="answers"
+    )
+
 
 class TestSession(Base):
     __tablename__ = "test_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "test_id",
+            "test_type",
+            name="uq_quality_bot_test_sessions_user_test_type",
+        ),
+        {"schema": DB_SCHEMA},
+    )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id")
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.users.id")
     )
 
     test_id: Mapped[int] = mapped_column(
-        ForeignKey("tests.id")
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.tests.id")
     )
 
     test_type: Mapped[str] = mapped_column(
@@ -250,9 +386,78 @@ class TestSession(Base):
         default=False,
     )
 
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     attempts: Mapped[int] = mapped_column(
         Integer,
         default=1,
+    )
+
+    user: Mapped["User"] = relationship(
+        back_populates="sessions"
+    )
+
+    test: Mapped["Test"] = relationship(
+        back_populates="sessions"
+    )
+
+    attempts_history: Mapped[list["TestAttempt"]] = relationship(
+        back_populates="session"
+    )
+
+
+class TestAttempt(Base):
+    __tablename__ = "test_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "attempt_number",
+            name="uq_quality_bot_test_attempts_session_number",
+        ),
+        {"schema": DB_SCHEMA},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+
+    session_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(f"{DB_SCHEMA}.test_sessions.id")
+    )
+
+    attempt_number: Mapped[int] = mapped_column(
+        Integer,
+        default=1,
+    )
+
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    passed: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+
+    session: Mapped["TestSession"] = relationship(
+        back_populates="attempts_history"
+    )
+
+    answers: Mapped[list["Answer"]] = relationship(
+        back_populates="attempt"
     )
 
 
@@ -286,13 +491,6 @@ class TestStates(StatesGroup):
 
 
 # =========================
-# MEMORY
-# =========================
-
-user_progress: Dict[int, Dict[str, int]] = {}
-
-
-# =========================
 # KEYBOARDS
 # =========================
 
@@ -307,6 +505,7 @@ moderator_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Пройти тест")],
         [KeyboardButton(text="➕ Добавить вопрос")],
+        [KeyboardButton(text="📢 Уведомление")],
     ],
     resize_keyboard=True,
 )
@@ -331,8 +530,13 @@ admin_keyboard = ReplyKeyboardMarkup(
 async def create_db():
     logger.info("📦 Creating database tables...")
     try:
+        sql_script = INIT_SCHEMA_SQL.read_text(encoding="utf-8")
+
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            for statement in sql_script.split(";"):
+                statement = statement.strip()
+                if statement:
+                    await conn.execute(text(statement))
         logger.info("✅ Database tables ready")
     except Exception as e:
         logger.error(f"❌ Database creation error: {e}")
@@ -425,6 +629,124 @@ async def already_completed_today(
     return result.scalar_one_or_none() is not None
 
 
+async def get_test_session(
+    session: AsyncSession,
+    user_id: int,
+    test_id: int,
+    test_type: str,
+):
+    result = await session.execute(
+        select(TestSession).where(
+            TestSession.user_id == user_id,
+            TestSession.test_id == test_id,
+            TestSession.test_type == test_type,
+        )
+    )
+
+    return result.scalar_one_or_none()
+
+
+async def get_current_attempt(
+    session: AsyncSession,
+    test_session: TestSession,
+):
+    result = await session.execute(
+        select(TestAttempt)
+        .where(
+            TestAttempt.session_id == test_session.id,
+            TestAttempt.completed_at.is_(None),
+        )
+        .order_by(TestAttempt.attempt_number.desc())
+    )
+
+    attempt = result.scalars().first()
+
+    if attempt:
+        return attempt
+
+    attempt = TestAttempt(
+        session_id=test_session.id,
+        attempt_number=test_session.attempts or 1,
+        passed=False,
+    )
+    session.add(attempt)
+    await session.flush()
+
+    return attempt
+
+
+async def get_or_create_test_session(
+    session: AsyncSession,
+    user_id: int,
+    test_id: int,
+    test_type: str,
+):
+    test_session = await get_test_session(
+        session,
+        user_id,
+        test_id,
+        test_type,
+    )
+
+    if test_session:
+        if not test_session.completed:
+            await get_current_attempt(session, test_session)
+        return test_session
+
+    test_session = TestSession(
+        user_id=user_id,
+        test_id=test_id,
+        test_type=test_type,
+        current_question=0,
+        completed=False,
+        attempts=1,
+    )
+    session.add(test_session)
+    await session.flush()
+
+    session.add(
+        TestAttempt(
+            session_id=test_session.id,
+            attempt_number=1,
+            passed=False,
+        )
+    )
+
+    return test_session
+
+
+async def is_test_approved(
+    session: AsyncSession,
+    test_id: int,
+) -> bool:
+    result = await session.execute(
+        select(Test.approved).where(
+            Test.id == test_id
+        )
+    )
+
+    return bool(result.scalar_one_or_none())
+
+
+def format_russian_date(value: date) -> str:
+    months = {
+        1: "января",
+        2: "февраля",
+        3: "марта",
+        4: "апреля",
+        5: "мая",
+        6: "июня",
+        7: "июля",
+        8: "августа",
+        9: "сентября",
+        10: "октября",
+        11: "ноября",
+        12: "декабря",
+    }
+
+    return f"{value.day} {months[value.month]} {value.year} года"
+
+
 # =========================
 # START
 # =========================
@@ -444,7 +766,7 @@ async def start_handler(message: Message, state: FSMContext):
 
             user = User(
                 telegram_id=message.from_user.id,
-                full_name=message.from_user.full_name or "Unknown",
+                full_name="Unknown",
                 is_whitelisted=False,
                 city="",
             )
@@ -452,10 +774,15 @@ async def start_handler(message: Message, state: FSMContext):
             session.add(user)
             await session.commit()
 
-            # Запрашиваем имя
-            await state.set_state(UserRegistrationStates.waiting_name)
-            msg = await message.answer("👤 Как вас зовут?")
-            await state.update_data(instruction_message_id=msg.message_id)
+        if (
+            not user.is_whitelisted
+            and message.from_user.id not in ADMIN_IDS
+            and message.from_user.id not in MODERATOR_IDS
+        ):
+            await state.clear()
+            await message.answer(
+                "⛔ У вас нет доступа"
+            )
             return
 
         # Если имя неполное или пусто - запрашиваем
@@ -470,16 +797,6 @@ async def start_handler(message: Message, state: FSMContext):
             await state.set_state(UserRegistrationStates.waiting_city)
             msg = await message.answer("🏙️ Из какого вы города?")
             await state.update_data(instruction_message_id=msg.message_id)
-            return
-
-        if (
-            not user.is_whitelisted
-            and message.from_user.id not in ADMIN_IDS
-            and message.from_user.id not in MODERATOR_IDS
-        ):
-            await message.answer(
-                "⛔ У вас нет доступа"
-            )
             return
 
         if message.from_user.id in ADMIN_IDS:
@@ -708,23 +1025,16 @@ async def start_test_from_callback(
             )
             return
 
-        new_session = TestSession(
+        new_session = await get_or_create_test_session(
+            session,
             user_id=user.id,
             test_id=test.id,
             test_type=test_type,
-            current_question=0,
-            completed=False,
         )
-
-        session.add(new_session)
 
         await session.commit()
 
         # Инициализируем прогресс для этого типа теста
-        if callback.from_user.id not in user_progress:
-            user_progress[callback.from_user.id] = {}
-        user_progress[callback.from_user.id][test_type] = 0
-
         # Сохраняем test_type в состояние для использования в send_question
         await state.update_data(test_type=test_type)
 
@@ -807,6 +1117,13 @@ async def add_question_start(
             session.add(test)
             await session.commit()
 
+        if test.approved:
+            await state.clear()
+            await message.answer(
+                "🔐 Тест уже опубликован, добавление вопросов закрыто"
+            )
+            return
+
         await state.update_data(
             test_id=test.id
         )
@@ -868,6 +1185,13 @@ async def handle_confirm_question(callback: CallbackQuery, state: FSMContext):
     
     # action == "yes" - подтверждаем и сохраняем вопрос
     async with async_session() as session:
+        if await is_test_approved(session, data["test_id"]):
+            await state.clear()
+            await callback.message.answer(
+                "🔐 Тест уже опубликован, добавление вопросов закрыто"
+            )
+            return
+
         result = await session.execute(
             select(Question).where(
                 Question.test_id == data["test_id"],
@@ -889,10 +1213,57 @@ async def handle_confirm_question(callback: CallbackQuery, state: FSMContext):
         session.add(question)
         await session.commit()
     
-    await state.clear()
-    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить еще вопрос", callback_data="add_question_more")
+    kb.button(text="✅ Закрыть", callback_data="add_question_finish")
+    kb.adjust(1)
+
+    await state.update_data(
+        test_id=data["test_id"],
+        question_test_type=data.get("question_test_type", "control"),
+    )
+
     await callback.message.answer(
-        "✅ Вопрос сохранён"
+        "✅ Вопрос сохранён",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data == "add_question_more")
+async def add_question_more(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.delete()
+
+    data = await state.get_data()
+
+    async with async_session() as session:
+        if await is_test_approved(session, data["test_id"]):
+            await state.clear()
+            await callback.message.answer(
+                "🔐 Тест уже опубликован, добавление вопросов закрыто"
+            )
+            return
+
+    await state.set_state(QuestionAddStates.waiting_photo)
+
+    msg = await callback.message.answer(
+        "📷 Отправьте изображение следующего вопроса"
+    )
+
+    await state.update_data(
+        instruction_message_id=msg.message_id
+    )
+
+
+@dp.callback_query(F.data == "add_question_finish")
+async def add_question_finish(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await callback.message.delete()
+
+    await state.clear()
+
+    await callback.message.answer(
+        "✅ Добавление вопросов завершено"
     )
 
 
@@ -912,6 +1283,15 @@ async def photo_handler(
     if current_state == QuestionAddStates.waiting_photo.state:
 
         photo = message.photo[-1]
+        data = await state.get_data()
+
+        async with async_session() as session:
+            if await is_test_approved(session, data["test_id"]):
+                await state.clear()
+                await message.answer(
+                    "🔐 Тест уже опубликован, добавление вопросов закрыто"
+                )
+                return
 
         await state.update_data(
             photo_id=photo.file_id
@@ -922,7 +1302,6 @@ async def photo_handler(
         await message.delete()
 
         # Удаляем предыдущее инструкционное сообщение
-        data = await state.get_data()
         if data.get("instruction_message_id"):
             try:
                 await message.bot.delete_message(
@@ -933,7 +1312,7 @@ async def photo_handler(
                 pass
 
         msg = await message.answer(
-            "Введите правильный ответ от 1 до 10"
+            "Введите правильный ответ числом"
         )
 
         await state.update_data(
@@ -952,12 +1331,26 @@ async def photo_handler(
         async with async_session() as session:
 
             result = await session.execute(
-                select(Question).where(
-                    Question.id == data["edit_question_id"]
-                )
+                select(Question, Test)
+                .join(Test, Test.id == Question.test_id)
+                .where(Question.id == data["edit_question_id"])
             )
 
-            q = result.scalar_one()
+            row = result.first()
+
+            if not row:
+                await state.clear()
+                await message.answer("❌ Вопрос не найден")
+                return
+
+            q, test = row
+
+            if test.approved:
+                await state.clear()
+                await message.answer(
+                    "🔐 Тест уже опубликован, редактирование закрыто"
+                )
+                return
 
             q.image_file_id = photo.file_id
 
@@ -1058,23 +1451,16 @@ async def start_test(
             )
             return
 
-        new_session = TestSession(
+        new_session = await get_or_create_test_session(
+            session,
             user_id=user.id,
             test_id=test.id,
             test_type=test_type,
-            current_question=0,
-            completed=False,
         )
-
-        session.add(new_session)
 
         await session.commit()
 
         # Инициализируем прогресс для этого типа теста
-        if message.from_user.id not in user_progress:
-            user_progress[message.from_user.id] = {}
-        user_progress[message.from_user.id][test_type] = 0
-
         # Сохраняем test_type в состояние для использования в send_question
         await state.update_data(test_type=test_type)
 
@@ -1104,9 +1490,28 @@ async def send_question(
         if not test:
             return
 
-        # Получаем тип теста из данных состояния
         data = await state.get_data()
         test_type = data.get("test_type", "control")
+
+        user = await get_user_by_tg_id(
+            session,
+            user_tg_id,
+        )
+
+        if not user:
+            return
+
+        test_session = await get_test_session(
+            session,
+            user.id,
+            test.id,
+            test_type,
+        )
+
+        if not test_session or test_session.completed:
+            return
+
+        attempt = await get_current_attempt(session, test_session)
 
         questions = await get_today_questions(
             session,
@@ -1114,78 +1519,41 @@ async def send_question(
             test_type,
         )
 
-        # Получаем индекс для этого конкретного test_type
-        if user_tg_id not in user_progress:
-            user_progress[user_tg_id] = {}
-        if test_type not in user_progress[user_tg_id]:
-            user_progress[user_tg_id][test_type] = 0
-
-        index = user_progress[user_tg_id][test_type]
+        index = test_session.current_question or 0
 
         if index >= len(questions):
-
-            user = await get_user_by_tg_id(
-                session,
-                user_tg_id,
-            )
-
-            result = await session.execute(
-                select(TestSession).where(
-                    TestSession.user_id == user.id,
-                    TestSession.test_id == test.id,
-                    TestSession.test_type == test_type,
-                    TestSession.completed == False,
-                )
-            )
-
-            test_session = result.scalars().first()
-            
-            if not test_session:
-                return
-
-            # ========== ПРОВЕРЯЕМ ВСЕ ОТВЕТЫ ==========
             answers_result = await session.execute(
-                select(Answer, Question) 
+                select(Answer, Question)
                 .join(Question, Question.id == Answer.question_id)
-                .where(Answer.user_id == user.id)
+                .where(Answer.attempt_id == attempt.id)
                 .where(Question.test_id == test.id)
                 .where(Question.test_type == test_type)
             )
             answers_data = answers_result.all()
 
-            # Проверяем, все ли ответы правильные
-            all_correct = True
-            for answer, question in answers_data:
-                if answer.answer != question.correct_answer:
-                    all_correct = False
-                    break
+            all_correct = (
+                len(answers_data) == len(questions)
+                and all(answer.is_correct for answer, _ in answers_data)
+            )
 
-            # ❌ ЕСТЬ ОШИБКА - ПОВТОРИТЬ ТЕСТ
+            now = datetime.now(timezone.utc)
+
             if not all_correct:
-                # Удаляем все ответы этой попытки
-                await session.execute(
-                    delete(Answer).where(
-                        Answer.user_id == user.id,
-                        Answer.question_id.in_(
-                            select(Question.id).where(
-                                Question.test_id == test.id,
-                                Question.test_type == test_type,
-                            )
-                        ),
+                attempt.completed_at = now
+                attempt.passed = False
+                test_session.attempts = (test_session.attempts or 1) + 1
+                test_session.current_question = 0
+
+                session.add(
+                    TestAttempt(
+                        session_id=test_session.id,
+                        attempt_number=test_session.attempts,
+                        passed=False,
                     )
                 )
 
-                # Увеличиваем попытки
-                test_session.attempts = (test_session.attempts or 0) + 1
-                
                 await session.commit()
 
-                # Сбрасываем прогресс в памяти
-                if user_tg_id in user_progress:
-                    if test_type in user_progress[user_tg_id]:
-                        user_progress[user_tg_id][test_type] = 0
-
-                # Удаляем предыдущее сообщение если оно есть
                 data = await state.get_data()
                 if data.get("last_question_message_id"):
                     try:
@@ -1197,7 +1565,7 @@ async def send_question(
                         pass
 
                 logger.warning(f"⚠️ User {user_tg_id} failed test {test.id} ({test_type}), attempt {test_session.attempts}")
-                
+
                 await bot.send_message(
                     user_tg_id,
                     f"❌ Тест не пройден\n\n"
@@ -1205,19 +1573,22 @@ async def send_question(
                     f"Начнём заново! 🔄"
                 )
 
-                # Перезагружаем тест с первого вопроса
+                await state.update_data(test_type=test_type)
+
                 await send_question(
                     user_tg_id,
                     state,
                 )
                 return
 
-            # ✅ ВСЕ ОТВЕТЫ ПРАВИЛЬНЫЕ - ТЕСТ ЗАВЕРШЕН
+            attempt.completed_at = now
+            attempt.passed = True
             test_session.completed = True
+            test_session.completed_at = now
+            test_session.current_question = len(questions)
 
             await session.commit()
 
-            # Удаляем предыдущее сообщение если оно есть
             data = await state.get_data()
             if data.get("last_question_message_id"):
                 try:
@@ -1229,7 +1600,7 @@ async def send_question(
                     pass
 
             logger.info(f"✅ User {user_tg_id} completed test {test.id} ({test_type}) in {test_session.attempts} attempt(s)")
-            
+
             await bot.send_message(
                 user_tg_id,
                 f"✅ Тест завершён!\n\n"
@@ -1241,17 +1612,6 @@ async def send_question(
 
         question = questions[index]
 
-        kb = InlineKeyboardBuilder()
-
-        for i in range(1, 11):
-            kb.button(
-                text=str(i),
-                callback_data=f"answer:{question.id}:{i}"
-            )
-
-        kb.adjust(5)
-
-        # Удаляем предыдущее сообщение если оно есть
         data = await state.get_data()
         if data.get("last_question_message_id"):
             try:
@@ -1262,19 +1622,20 @@ async def send_question(
             except:
                 pass
 
-        # Отправляем новый вопрос и сохраняем его ID
         sent_message = await bot.send_photo(
             user_tg_id,
             question.image_file_id,
             caption=(
                 f"Вопрос {index + 1} "
-                f"из {len(questions)}"
+                f"из {len(questions)}\n\n"
+                f"Введите ответ сообщением"
             ),
-            reply_markup=kb.as_markup(),
         )
 
         await state.update_data(
-            last_question_message_id=sent_message.message_id
+            last_question_message_id=sent_message.message_id,
+            current_question_id=question.id,
+            test_type=test_type,
         )
 
 
@@ -1348,6 +1709,50 @@ async def handle_view_test_type(callback: CallbackQuery, state: FSMContext):
         )
 
 
+@dp.callback_query(F.data.startswith("preview_test_type:"))
+async def handle_preview_test_type(callback: CallbackQuery):
+    test_type = callback.data.split(":")[1]
+
+    await callback.answer()
+
+    async with async_session() as session:
+
+        test = await get_test_for_passing(session)
+
+        if not test:
+            await callback.message.answer(
+                "❌ Тест не найден"
+            )
+            return
+
+        questions = await get_today_questions(
+            session,
+            test.id,
+            test_type,
+        )
+
+        if not questions:
+            await callback.message.answer(
+                f"❌ Вопросов нет в типе '{test_type}'"
+            )
+            return
+
+        kb = InlineKeyboardBuilder()
+
+        for q in questions:
+            kb.button(
+                text=f"Вопрос {q.question_order}",
+                callback_data=f"admin_q:{q.id}"
+            )
+
+        kb.adjust(3)
+
+        await callback.message.answer(
+            f"📋 Проверка теста ({test_type}):",
+            reply_markup=kb.as_markup()
+        )
+
+
 # =========================
 # ADMIN QUESTION VIEW
 # =========================
@@ -1374,19 +1779,27 @@ async def admin_view_question(
 
         q = result.scalar_one()
 
+        test_result = await session.execute(
+            select(Test).where(
+                Test.id == q.test_id
+            )
+        )
+        test = test_result.scalar_one()
+
     kb = InlineKeyboardBuilder()
 
-    kb.button(
-        text="✏️ Картинка",
-        callback_data=f"edit_img:{q.id}"
-    )
+    if not test.approved:
+        kb.button(
+            text="✏️ Картинка",
+            callback_data=f"edit_img:{q.id}"
+        )
 
-    kb.button(
-        text="✏️ Ответ",
-        callback_data=f"edit_ans:{q.id}"
-    )
+        kb.button(
+            text="✏️ Ответ",
+            callback_data=f"edit_ans:{q.id}"
+        )
 
-    kb.adjust(1)
+        kb.adjust(1)
 
     await callback.answer()
 
@@ -1395,14 +1808,83 @@ async def admin_view_question(
         caption=(
             f"📌 Вопрос {q.question_order}\n"
             f"🔒 Ответ: {q.correct_answer}"
+            + ("\n\n🔐 Тест уже опубликован, редактирование закрыто" if test.approved else "")
         ),
-        reply_markup=kb.as_markup()
+        reply_markup=kb.as_markup() if not test.approved else None
     )
 
 
 # =========================
 # PROCESS ANSWER
 # =========================
+
+async def save_test_answer(
+    user_tg_id: int,
+    state: FSMContext,
+    question_id: int,
+    answer: int,
+) -> bool:
+    async with async_session() as session:
+
+        user = await get_user_by_tg_id(
+            session,
+            user_tg_id,
+        )
+
+        question_result = await session.execute(
+            select(Question).where(
+                Question.id == question_id
+            )
+        )
+        question = question_result.scalar_one_or_none()
+
+        if not user or not question:
+            return False
+
+        test_session = await get_test_session(
+            session,
+            user.id,
+            question.test_id,
+            question.test_type,
+        )
+
+        if not test_session or test_session.completed:
+            return False
+
+        attempt = await get_current_attempt(session, test_session)
+
+        existing_result = await session.execute(
+            select(Answer).where(
+                Answer.attempt_id == attempt.id,
+                Answer.question_id == question.id,
+            )
+        )
+        existing_answer = existing_result.scalar_one_or_none()
+
+        is_correct = answer == question.correct_answer
+
+        if existing_answer:
+            existing_answer.answer = answer
+            existing_answer.is_correct = is_correct
+            existing_answer.correct_answer_at_time = question.correct_answer
+        else:
+            session.add(
+                Answer(
+                    attempt_id=attempt.id,
+                    user_id=user.id,
+                    question_id=question.id,
+                    answer=answer,
+                    is_correct=is_correct,
+                    correct_answer_at_time=question.correct_answer,
+                )
+            )
+            test_session.current_question = (test_session.current_question or 0) + 1
+
+        await session.commit()
+        await state.update_data(test_type=question.test_type)
+
+    return True
+
 
 @dp.callback_query(F.data.startswith("answer:"))
 async def process_answer(
@@ -1416,37 +1898,72 @@ async def process_answer(
 
     answer = int(parts[2])
 
-    async with async_session() as session:
+    saved = await save_test_answer(
+        callback.from_user.id,
+        state,
+        question_id,
+        answer,
+    )
 
-        user = await get_user_by_tg_id(
-            session,
-            callback.from_user.id,
-        )
-
-        new_answer = Answer(
-            user_id=user.id,
-            question_id=question_id,
-            answer=answer,
-        )
-
-        session.add(new_answer)
-
-        await session.commit()
-
-    # Получаем test_type из состояния
-    data = await state.get_data()
-    test_type = data.get("test_type", "control")
-
-    # Увеличиваем индекс для этого конкретного test_type
-    if callback.from_user.id not in user_progress:
-        user_progress[callback.from_user.id] = {}
-    if test_type not in user_progress[callback.from_user.id]:
-        user_progress[callback.from_user.id][test_type] = 0
-    user_progress[callback.from_user.id][test_type] += 1
+    if not saved:
+        await callback.answer()
+        return
 
     await callback.message.delete()
 
     await callback.answer()
+
+    await send_question(
+        callback.from_user.id,
+        state,
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_test_answer:"))
+async def confirm_test_answer(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":")[1]
+
+    await callback.answer()
+    await callback.message.delete()
+
+    data = await state.get_data()
+
+    if action == "no":
+        await state.update_data(
+            pending_question_id=None,
+            pending_answer=None,
+        )
+        await callback.message.answer(
+            "Введите ответ еще раз"
+        )
+        return
+
+    question_id = data.get("pending_question_id")
+    answer = data.get("pending_answer")
+
+    if question_id is None or answer is None:
+        await callback.message.answer(
+            "❌ Ответ не найден. Введите ответ еще раз"
+        )
+        return
+
+    saved = await save_test_answer(
+        callback.from_user.id,
+        state,
+        int(question_id),
+        int(answer),
+    )
+
+    await state.update_data(
+        pending_question_id=None,
+        pending_answer=None,
+    )
+
+    if not saved:
+        await callback.message.answer(
+            "❌ Не удалось сохранить ответ. Попробуйте еще раз"
+        )
+        return
 
     await send_question(
         callback.from_user.id,
@@ -1465,11 +1982,39 @@ async def edit_image_start(
 ):
 
     if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "⛔ У вас нет доступа к редактированию. Напишите администратору @dezztape",
+            show_alert=True,
+        )
         return
 
     question_id = int(
         callback.data.split(":")[1]
     )
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Question, Test)
+            .join(Test, Test.id == Question.test_id)
+            .where(Question.id == question_id)
+        )
+        row = result.first()
+
+        if not row:
+            await callback.answer(
+                "Вопрос не найден",
+                show_alert=True,
+            )
+            return
+
+        _, test = row
+
+        if test.approved:
+            await callback.answer(
+                "Тест уже опубликован, редактирование закрыто",
+                show_alert=True,
+            )
+            return
 
     await state.update_data(
         edit_question_id=question_id
@@ -1501,11 +2046,39 @@ async def edit_answer_start(
 ):
 
     if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "⛔ У вас нет доступа к редактированию. Напишите администратору @dezztape",
+            show_alert=True,
+        )
         return
 
     question_id = int(
         callback.data.split(":")[1]
     )
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Question, Test)
+            .join(Test, Test.id == Question.test_id)
+            .where(Question.id == question_id)
+        )
+        row = result.first()
+
+        if not row:
+            await callback.answer(
+                "Вопрос не найден",
+                show_alert=True,
+            )
+            return
+
+        _, test = row
+
+        if test.approved:
+            await callback.answer(
+                "Тест уже опубликован, редактирование закрыто",
+                show_alert=True,
+            )
+            return
 
     await state.update_data(
         edit_question_id=question_id
@@ -1518,7 +2091,7 @@ async def edit_answer_start(
     await callback.answer()
 
     msg = await callback.message.answer(
-        "✏️ Введите новый правильный ответ (1-10)"
+        "✏️ Введите новый правильный ответ числом"
     )
 
     await state.update_data(
@@ -1618,10 +2191,31 @@ async def show_statistics(message: Message, test_type: str):
             user_stats[ts.user_id]['attempts'] = ts.attempts
 
             # Получаем ответы для этой сессии
+            attempt_query = select(TestAttempt).where(
+                TestAttempt.session_id == ts.id,
+            )
+
+            if ts.completed:
+                attempt_query = attempt_query.where(
+                    TestAttempt.passed == True
+                )
+            else:
+                attempt_query = attempt_query.where(
+                    TestAttempt.completed_at.is_(None)
+                )
+
+            attempt_result = await session.execute(
+                attempt_query.order_by(TestAttempt.attempt_number.desc())
+            )
+            attempt = attempt_result.scalars().first()
+
+            if not attempt:
+                continue
+
             answers_result = await session.execute(
                 select(Answer, Question)
                 .join(Question, Question.id == Answer.question_id)
-                .where(Answer.user_id == ts.user_id)
+                .where(Answer.attempt_id == attempt.id)
                 .where(Question.test_id == test.id)
                 .where(Question.test_type == test_type)
             )
@@ -1629,7 +2223,7 @@ async def show_statistics(message: Message, test_type: str):
 
             for answer, question in answers_data:
                 user_stats[ts.user_id]['total_questions'] += 1
-                if answer.answer == question.correct_answer:
+                if answer.is_correct:
                     user_stats[ts.user_id]['correct_answers'] += 1
 
         # Форматируем результаты
@@ -1671,7 +2265,7 @@ async def show_statistics(message: Message, test_type: str):
 
 async def notification_handler(message: Message):
 
-    if not await is_admin(message.from_user.id):
+    if not await is_admin_or_moderator(message.from_user.id):
         await message.answer(
             "⛔ У вас нет доступа"
         )
@@ -1701,11 +2295,63 @@ async def notification_handler(message: Message):
             )
             return
 
-        # Одобряем тест
+        kb = InlineKeyboardBuilder()
+        kb.button(text="👀 Проверить контроль", callback_data="preview_test_type:control")
+        kb.button(text="👀 Проверить опыт", callback_data="preview_test_type:experience")
+        kb.button(text="📢 Отправить уведомление", callback_data="publish_test_notification")
+        kb.button(text="❌ Отмена", callback_data="cancel_test_notification")
+        kb.adjust(1)
+
+        await message.answer(
+            "Перед отправкой уведомления проверьте тест.\n\n"
+            "После отправки уведомления редактирование вопросов будет закрыто.",
+            reply_markup=kb.as_markup(),
+        )
+
+
+@dp.callback_query(F.data == "cancel_test_notification")
+async def cancel_test_notification(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.delete()
+
+
+@dp.callback_query(F.data == "publish_test_notification")
+async def publish_test_notification(callback: CallbackQuery):
+    if not await is_admin_or_moderator(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    await callback.message.delete()
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Test).where(
+                Test.test_date == date.today(),
+                Test.active == True,
+            )
+        )
+        test = result.scalars().first()
+
+        if not test:
+            await callback.message.answer(
+                "❌ Тест не найден"
+            )
+            return
+
+        if test.approved:
+            await callback.message.answer(
+                "ℹ️ Тест уже одобрен и опубликован"
+            )
+            return
+
         test.approved = True
+        test.approved_at = datetime.now(timezone.utc)
         await session.commit()
 
-        # Получаем всех сотрудников (не админов)
         users_result = await session.execute(
             select(User).where(
                 User.telegram_id.notin_(ADMIN_IDS)
@@ -1713,7 +2359,6 @@ async def notification_handler(message: Message):
         )
         users = users_result.scalars().all()
 
-        # Отправляем уведомление всем сотрудникам
         success_count = 0
         for user in users:
             try:
@@ -1727,7 +2372,7 @@ async def notification_handler(message: Message):
             except:
                 pass
 
-        await message.answer(
+        await callback.message.answer(
             f"✅ Тест одобрен!\n\n"
             f"📨 Уведомления отправлены: {success_count} сотрудникам"
         )
@@ -1795,10 +2440,23 @@ async def export_handler(message: Message):
             user_data[user.id]['sessions'][test_type] = {}
 
             # Получаем ответы для этой сессии, фильтруя по test_type
+            attempt_result = await session.execute(
+                select(TestAttempt)
+                .where(
+                    TestAttempt.session_id == ts.id,
+                    TestAttempt.passed == True,
+                )
+                .order_by(TestAttempt.attempt_number.desc())
+            )
+            attempt = attempt_result.scalars().first()
+
+            if not attempt:
+                continue
+
             answers_result = await session.execute(
                 select(Answer, Question)
                 .join(Question, Question.id == Answer.question_id)
-                .where(Answer.user_id == user.id)
+                .where(Answer.attempt_id == attempt.id)
                 .where(Question.test_id == test.id)
                 .where(Question.test_type == test_type)
                 .order_by(Question.question_order)
@@ -1813,6 +2471,7 @@ async def export_handler(message: Message):
 
         # Создаем Excel файл
         filename = f"results_{test.id}_{date.today().strftime('%d_%m_%Y')}.xlsx"
+        test_date_label = format_russian_date(test.test_date)
         wb = Workbook()
         # Удаляем пустой лист только если будут созданы новые
         default_sheet = wb.active
@@ -1846,7 +2505,7 @@ async def export_handler(message: Message):
                 ws = wb.create_sheet(title=sheet_name)
 
             # Заголовок
-            ws['A1'] = f"Контроль качества №{test.id} {date.today().strftime('%B')}"
+            ws['A1'] = f"Контроль качества №{test.id} {test_date_label}"
             ws['A2'] = user.city if user.city else ""
 
             # Объединяем ячейки для заголовка
@@ -1947,6 +2606,47 @@ async def text_handler(
     if not current_state:
         return
 
+    if current_state == TestStates.passing_test.state:
+        if not message.text:
+            return
+
+        if not message.text.isdigit():
+            await message.answer(
+                "Введите ответ числом"
+            )
+            return
+
+        data = await state.get_data()
+        question_id = data.get("current_question_id")
+
+        if not question_id:
+            await message.answer(
+                "❌ Не удалось определить текущий вопрос. Нажмите «Пройти тест» еще раз"
+            )
+            return
+
+        answer = int(message.text)
+
+        await state.update_data(
+            pending_question_id=question_id,
+            pending_answer=answer,
+        )
+
+        await message.delete()
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Подтвердить", callback_data="confirm_test_answer:yes")
+        kb.button(text="❌ Изменить", callback_data="confirm_test_answer:no")
+        kb.adjust(2)
+
+        await message.answer(
+            f"Ваш ответ: <b>{answer}</b>\n\nПодтвердить?",
+            reply_markup=kb.as_markup(),
+            parse_mode=ParseMode.HTML,
+        )
+
+        return
+
     # ДОБАВЛЕНИЕ ВОПРОСА
     if current_state == QuestionAddStates.waiting_answer.state:
 
@@ -1972,26 +2672,15 @@ async def text_handler(
 
         answer = int(message.text)
 
-        if answer < 1 or answer > 10:
-            data = await state.get_data()
-            if data.get("instruction_message_id"):
-                try:
-                    await message.bot.delete_message(
-                        message.chat.id,
-                        data["instruction_message_id"]
-                    )
-                except:
-                    pass
-
-            msg = await message.answer(
-                "Ответ должен быть от 1 до 10"
-            )
-            await state.update_data(
-                instruction_message_id=msg.message_id
-            )
-            return
-
         data = await state.get_data()
+
+        async with async_session() as session:
+            if await is_test_approved(session, data["test_id"]):
+                await state.clear()
+                await message.answer(
+                    "🔐 Тест уже опубликован, добавление вопросов закрыто"
+                )
+                return
         
         # Сохраняем ответ в state и переходим на подтверждение
         await state.update_data(correct_answer=answer)
@@ -2050,36 +2739,31 @@ async def text_handler(
 
         answer = int(message.text)
 
-        if answer < 1 or answer > 10:
-            data = await state.get_data()
-            if data.get("instruction_message_id"):
-                try:
-                    await message.bot.delete_message(
-                        message.chat.id,
-                        data["instruction_message_id"]
-                    )
-                except:
-                    pass
-
-            msg = await message.answer(
-                "Ответ должен быть 1–10"
-            )
-            await state.update_data(
-                instruction_message_id=msg.message_id
-            )
-            return
-
         data = await state.get_data()
 
         async with async_session() as session:
 
             result = await session.execute(
-                select(Question).where(
-                    Question.id == data["edit_question_id"]
-                )
+                select(Question, Test)
+                .join(Test, Test.id == Question.test_id)
+                .where(Question.id == data["edit_question_id"])
             )
 
-            q = result.scalar_one()
+            row = result.first()
+
+            if not row:
+                await state.clear()
+                await message.answer("❌ Вопрос не найден")
+                return
+
+            q, test = row
+
+            if test.approved:
+                await state.clear()
+                await message.answer(
+                    "🔐 Тест уже опубликован, редактирование закрыто"
+                )
+                return
 
             q.correct_answer = answer
 
@@ -2110,9 +2794,16 @@ async def text_handler(
 # MAIN
 # =========================
 
+async def setup_bot_commands():
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать"),
+    ])
+
+
 async def main():
 
     await create_db()
+    await setup_bot_commands()
     
     logger.info("🚀 Bot started, polling messages...")
 
