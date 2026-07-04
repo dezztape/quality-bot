@@ -1,7 +1,7 @@
 import asyncio
 import os
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -910,18 +910,9 @@ async def results_button(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
-    
-    await state.set_state(TestSelectionStates.choosing_test_type)
-    
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Контроль", callback_data="stats_type:control")
-    kb.button(text="📚 Опыт", callback_data="stats_type:experience")
-    kb.adjust(1)
-    
-    await message.answer(
-        "Выберите тип теста для просмотра статистики:",
-        reply_markup=kb.as_markup()
-    )
+
+    await state.clear()
+    await show_statistics(message)
 
 
 @dp.message(F.text == "📁 Экспорт Excel")
@@ -2118,21 +2109,12 @@ async def results_command(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
-    
-    await state.set_state(TestSelectionStates.choosing_test_type)
-    
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Контроль", callback_data="stats_type:control")
-    kb.button(text="📚 Опыт", callback_data="stats_type:experience")
-    kb.adjust(1)
-    
-    await message.answer(
-        "Выберите тип теста для просмотра статистики:",
-        reply_markup=kb.as_markup()
-    )
+
+    await state.clear()
+    await show_statistics(message)
 
 
-async def show_statistics(message: Message, test_type: str):
+async def show_statistics(message: Message, test_type: str | None = None):
 
     async with async_session() as session:
 
@@ -2156,101 +2138,110 @@ async def show_statistics(message: Message, test_type: str):
             )
             return
 
-        # Собираем статистику по пользователям
-        user_stats = {}
-        
-        for user in all_users:
-            user_stats[user.id] = {
-                'user': user,
-                'total_questions': 0,
-                'correct_answers': 0,
-                'attempts': 1,
-                'status': "❌ Не начат",  # По умолчанию не начат
-            }
-
-        # Получаем все тестовые сессии для этого типа
-        sessions_result = await session.execute(
-            select(TestSession).where(
-                TestSession.test_id == test.id,
-                TestSession.test_type == test_type,
-            )
+        test_types = (
+            [(test_type, "Контроль" if test_type == "control" else "Опыт")]
+            if test_type
+            else [
+                ("control", "Контроль"),
+                ("experience", "Опыт"),
+            ]
         )
-        test_sessions = sessions_result.scalars().all()
 
-        # Обновляем статистику для пользователей с сессиями
-        for ts in test_sessions:
-            if ts.user_id not in user_stats:
-                continue
+        user_stats = {
+            user.id: {
+                "user": user,
+                "types": {
+                    current_type: {
+                        "total_questions": 0,
+                        "correct_answers": 0,
+                        "attempts": 1,
+                        "status": "❌ Не начат",
+                    }
+                    for current_type, _ in test_types
+                },
+            }
+            for user in all_users
+        }
 
-            # Определяем статус
-            if ts.completed:
-                user_stats[ts.user_id]['status'] = "✅ Завершен"
-            else:
-                user_stats[ts.user_id]['status'] = "⏳ В процессе"
-
-            user_stats[ts.user_id]['attempts'] = ts.attempts
-
-            # Получаем ответы для этой сессии
-            attempt_query = select(TestAttempt).where(
-                TestAttempt.session_id == ts.id,
-            )
-
-            if ts.completed:
-                attempt_query = attempt_query.where(
-                    TestAttempt.passed == True
+        for current_type, _ in test_types:
+            sessions_result = await session.execute(
+                select(TestSession).where(
+                    TestSession.test_id == test.id,
+                    TestSession.test_type == current_type,
                 )
-            else:
-                attempt_query = attempt_query.where(
-                    TestAttempt.completed_at.is_(None)
+            )
+            test_sessions = sessions_result.scalars().all()
+
+            for ts in test_sessions:
+                if ts.user_id not in user_stats:
+                    continue
+
+                stats = user_stats[ts.user_id]["types"][current_type]
+                stats["status"] = "✅ Завершен" if ts.completed else "⏳ В процессе"
+                stats["attempts"] = ts.attempts
+
+                attempt_query = select(TestAttempt).where(
+                    TestAttempt.session_id == ts.id,
                 )
 
-            attempt_result = await session.execute(
-                attempt_query.order_by(TestAttempt.attempt_number.desc())
-            )
-            attempt = attempt_result.scalars().first()
+                if ts.completed:
+                    attempt_query = attempt_query.where(
+                        TestAttempt.passed == True
+                    )
+                else:
+                    attempt_query = attempt_query.where(
+                        TestAttempt.completed_at.is_(None)
+                    )
 
-            if not attempt:
-                continue
+                attempt_result = await session.execute(
+                    attempt_query.order_by(TestAttempt.attempt_number.desc())
+                )
+                attempt = attempt_result.scalars().first()
 
-            answers_result = await session.execute(
-                select(Answer, Question)
-                .join(Question, Question.id == Answer.question_id)
-                .where(Answer.attempt_id == attempt.id)
-                .where(Question.test_id == test.id)
-                .where(Question.test_type == test_type)
-            )
-            answers_data = answers_result.all()
+                if not attempt:
+                    continue
 
-            for answer, question in answers_data:
-                user_stats[ts.user_id]['total_questions'] += 1
-                if answer.is_correct:
-                    user_stats[ts.user_id]['correct_answers'] += 1
+                answers_result = await session.execute(
+                    select(Answer, Question)
+                    .join(Question, Question.id == Answer.question_id)
+                    .where(Answer.attempt_id == attempt.id)
+                    .where(Question.test_id == test.id)
+                    .where(Question.test_type == current_type)
+                )
+                answers_data = answers_result.all()
 
-        # Форматируем результаты
-        test_type_name = "Контроль" if test_type == "control" else "Опыт"
-        text = f"📊 Статистика - {test_type_name}\n"
+                for answer, question in answers_data:
+                    stats["total_questions"] += 1
+                    if answer.is_correct:
+                        stats["correct_answers"] += 1
+
+        text = "📊 Статистика\n" if test_type is None else f"📊 Статистика - {test_types[0][1]}\n"
         text += f"Тест №{test.id}\n"
         text += "=" * 40 + "\n\n"
 
         for user_id in sorted(user_stats.keys()):
-            stats = user_stats[user_id]
-            user = stats['user']
-            
-            total = stats['total_questions']
-            correct = stats['correct_answers']
-            percent = (correct / total * 100) if total > 0 else 0
-            status = stats['status']
+            user_data = user_stats[user_id]
+            user = user_data["user"]
 
             admin_label = " (Админ)" if user.telegram_id in ADMIN_IDS else ""
 
             text += f"👤 {user.full_name}{admin_label}\n"
-            text += f"📍 {user.city}\n"
-            
-            if total > 0:
-                text += f"✅ Правильных: {correct}/{total} ({percent:.0f}%)\n"
-                text += f"🔄 Попыток: {stats['attempts']}\n"
-            
-            text += f"📌 {status}\n"
+
+            for current_type, type_name in test_types:
+                stats = user_data["types"][current_type]
+                total = stats["total_questions"]
+                correct = stats["correct_answers"]
+                percent = (correct / total * 100) if total > 0 else 0
+
+                text += f"{type_name}\n"
+                text += f"📍 {user.city or '-'}\n"
+
+                if total > 0:
+                    text += f"✅ Правильных: {correct}/{total} ({percent:.0f}%)\n"
+                    text += f"🔄 Попыток: {stats['attempts']}\n"
+
+                text += f"📌 {stats['status']}\n"
+
             text += "-" * 40 + "\n\n"
 
         if len(text) > 4000:
@@ -2390,9 +2381,118 @@ async def export_handler(message: Message):
         )
         return
 
-    async with async_session() as session:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Сегодня", callback_data="export_date:today")
+    kb.button(text="↩️ Вчера", callback_data="export_date:yesterday")
+    kb.button(text="🗓 Доступные дни", callback_data="export_available_days")
+    kb.adjust(1)
 
-        test = await get_active_test(session)
+    await message.answer(
+        "Выберите день для выгрузки Excel:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("export_date:"))
+async def handle_export_date(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    period = callback.data.split(":")[1]
+    export_date = date.today()
+
+    if period == "yesterday":
+        export_date = date.today() - timedelta(days=1)
+
+    await callback.answer()
+    await callback.message.delete()
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Test).where(
+                Test.test_date == export_date,
+            )
+        )
+        test = result.scalar_one_or_none()
+
+    if not test:
+        await callback.message.answer(
+            f"❌ Тест за {format_russian_date(export_date)} не найден"
+        )
+        return
+
+    await export_test_results(callback.message, test.id)
+
+
+@dp.callback_query(F.data == "export_available_days")
+async def handle_export_available_days(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    await callback.message.delete()
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Test)
+            .order_by(Test.test_date.desc())
+            .limit(30)
+        )
+        tests = result.scalars().all()
+
+    if not tests:
+        await callback.message.answer(
+            "❌ Доступных дней для экспорта нет"
+        )
+        return
+
+    kb = InlineKeyboardBuilder()
+    for test in tests:
+        kb.button(
+            text=format_russian_date(test.test_date),
+            callback_data=f"export_test:{test.id}",
+        )
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "Выберите день для выгрузки Excel:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("export_test:"))
+async def handle_export_test(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    test_id = int(callback.data.split(":")[1])
+
+    await callback.answer()
+    await callback.message.delete()
+
+    await export_test_results(callback.message, test_id)
+
+
+async def export_test_results(message: Message, test_id: int):
+    async with async_session() as session:
+        result = await session.execute(
+            select(Test).where(
+                Test.id == test_id,
+            )
+        )
+        test = result.scalar_one_or_none()
 
         if not test:
             await message.answer(
@@ -2470,7 +2570,7 @@ async def export_handler(message: Message):
                 user_data[user.id]['sessions'][test_type][q_order] = answer.answer
 
         # Создаем Excel файл
-        filename = f"results_{test.id}_{date.today().strftime('%d_%m_%Y')}.xlsx"
+        filename = f"results_{test.id}_{test.test_date.strftime('%d_%m_%Y')}.xlsx"
         test_date_label = format_russian_date(test.test_date)
         wb = Workbook()
         # Удаляем пустой лист только если будут созданы новые
