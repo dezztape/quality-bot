@@ -747,6 +747,10 @@ def format_russian_date(value: date) -> str:
     return f"{value.day} {months[value.month]} {value.year} года"
 
 
+def get_test_type_name(test_type: str) -> str:
+    return "Контроль" if test_type == "control" else "Опыт"
+
+
 # =========================
 # START
 # =========================
@@ -894,7 +898,7 @@ async def start_test_button(
     message: Message,
     state: FSMContext,
 ):
-    await choose_test_type(message, state)
+    await start_test(message, state)
 
 
 @dp.message(F.text == "➕ Добавить вопрос")
@@ -912,7 +916,7 @@ async def results_button(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await show_statistics(message)
+    await show_statistics_menu(message)
 
 
 @dp.message(F.text == "📁 Экспорт Excel")
@@ -1380,15 +1384,16 @@ async def start_test_command(
     message: Message,
     state: FSMContext,
 ):
-    await choose_test_type(message, state)
+    await start_test(message, state)
 
 
 async def start_test(
     message: Message,
     state: FSMContext,
-    test_type: str = "control",
+    test_type: str | None = None,
 ):
-    logger.info(f"📝 User {message.from_user.id} starting {test_type} test")
+    requested_test_type = test_type
+    logger.info(f"📝 User {message.from_user.id} starting test")
 
     async with async_session() as session:
 
@@ -1416,6 +1421,32 @@ async def start_test(
                 "❌ На сегодня тест отсутствует или не одобрен"
             )
             return
+
+        if requested_test_type is None:
+            for candidate_type in ("control", "experience"):
+                completed = await already_completed_today(
+                    session,
+                    user.id,
+                    test.id,
+                    candidate_type,
+                )
+                questions = await get_today_questions(
+                    session,
+                    test.id,
+                    candidate_type,
+                )
+
+                if questions and not completed:
+                    test_type = candidate_type
+                    break
+
+            if test_type is None:
+                await message.answer(
+                    "✅ Вы уже прошли все доступные тесты сегодня"
+                )
+                return
+
+        logger.info(f"📝 User {message.from_user.id} starting {test_type} test")
 
         completed = await already_completed_today(
             session,
@@ -1458,6 +1489,11 @@ async def start_test(
         await state.set_state(
             TestStates.passing_test
         )
+
+        if test_type == "control":
+            await message.answer("📋 Начинаем контроль")
+        else:
+            await message.answer("📚 Начинаем опыт")
 
         await send_question(
             message.from_user.id,
@@ -1530,6 +1566,13 @@ async def send_question(
             now = datetime.now(timezone.utc)
 
             if not all_correct:
+                failed_attempt_number = attempt.attempt_number
+                wrong_answers = [
+                    (answer, question)
+                    for answer, question in answers_data
+                    if not answer.is_correct
+                ]
+
                 attempt.completed_at = now
                 attempt.passed = False
                 test_session.attempts = (test_session.attempts or 1) + 1
@@ -1560,9 +1603,27 @@ async def send_question(
                 await bot.send_message(
                     user_tg_id,
                     f"❌ Тест не пройден\n\n"
-                    f"Попытка #{test_session.attempts}\n\n"
+                    f"{get_test_type_name(test_type)}\n"
+                    f"Провальная попытка #{failed_attempt_number}\n\n"
                     f"Начнём заново! 🔄"
                 )
+
+                if failed_attempt_number == 5 and wrong_answers:
+                    await bot.send_message(
+                        user_tg_id,
+                        "Ниже вопросы, где были ошибки. Правильные ответы не показываю."
+                    )
+
+                    for wrong_answer, wrong_question in wrong_answers:
+                        await bot.send_photo(
+                            user_tg_id,
+                            wrong_question.image_file_id,
+                            caption=(
+                                f"❌ {get_test_type_name(test_type)}\n"
+                                f"Вопрос {wrong_question.question_order}\n"
+                                f"Ваш ответ: {wrong_answer.answer}"
+                            ),
+                        )
 
                 await state.update_data(test_type=test_type)
 
@@ -1592,9 +1653,45 @@ async def send_question(
 
             logger.info(f"✅ User {user_tg_id} completed test {test.id} ({test_type}) in {test_session.attempts} attempt(s)")
 
+            if test_type == "control":
+                experience_questions = await get_today_questions(
+                    session,
+                    test.id,
+                    "experience",
+                )
+                experience_completed = await already_completed_today(
+                    session,
+                    user.id,
+                    test.id,
+                    "experience",
+                )
+
+                if experience_questions and not experience_completed:
+                    await get_or_create_test_session(
+                        session,
+                        user.id,
+                        test.id,
+                        "experience",
+                    )
+                    await session.commit()
+
+                    await bot.send_message(
+                        user_tg_id,
+                        f"✅ Контроль завершён успешно\n\n"
+                        f"Количество попыток: {test_session.attempts}\n\n"
+                        f"📚 Переходим к опыту"
+                    )
+
+                    await state.update_data(test_type="experience")
+                    await send_question(
+                        user_tg_id,
+                        state,
+                    )
+                    return
+
             await bot.send_message(
                 user_tg_id,
-                f"✅ Тест завершён!\n\n"
+                f"✅ {get_test_type_name(test_type)} завершён успешно!\n\n"
                 f"Количество попыток: {test_session.attempts}"
             )
 
@@ -1617,6 +1714,7 @@ async def send_question(
             user_tg_id,
             question.image_file_id,
             caption=(
+                f"{get_test_type_name(test_type)}\n"
                 f"Вопрос {index + 1} "
                 f"из {len(questions)}\n\n"
                 f"Введите ответ сообщением"
@@ -2111,14 +2209,131 @@ async def results_command(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await show_statistics(message)
+    await show_statistics_menu(message)
 
 
-async def show_statistics(message: Message, test_type: str | None = None):
+async def show_statistics_menu(message: Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📅 Сегодня", callback_data="stats_date:today")
+    kb.button(text="↩️ Вчера", callback_data="stats_date:yesterday")
+    kb.button(text="🗓 Доступные дни", callback_data="stats_available_days")
+    kb.adjust(1)
+
+    await message.answer(
+        "Выберите день для просмотра статистики:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("stats_date:"))
+async def handle_stats_date(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    period = callback.data.split(":")[1]
+    stats_date = date.today()
+
+    if period == "yesterday":
+        stats_date = date.today() - timedelta(days=1)
+
+    await callback.answer()
+    await callback.message.delete()
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Test).where(
+                Test.test_date == stats_date,
+            )
+        )
+        test = result.scalar_one_or_none()
+
+    if not test:
+        await callback.message.answer(
+            f"❌ Тест за {format_russian_date(stats_date)} не найден"
+        )
+        return
+
+    await show_statistics(callback.message, test_id=test.id)
+
+
+@dp.callback_query(F.data == "stats_available_days")
+async def handle_stats_available_days(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+    await callback.message.delete()
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Test)
+            .order_by(Test.test_date.desc())
+            .limit(30)
+        )
+        tests = result.scalars().all()
+
+    if not tests:
+        await callback.message.answer(
+            "❌ Доступных дней для статистики нет"
+        )
+        return
+
+    kb = InlineKeyboardBuilder()
+    for test in tests:
+        kb.button(
+            text=format_russian_date(test.test_date),
+            callback_data=f"stats_test:{test.id}",
+        )
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "Выберите день для просмотра статистики:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("stats_test:"))
+async def handle_stats_test(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
+    test_id = int(callback.data.split(":")[1])
+
+    await callback.answer()
+    await callback.message.delete()
+
+    await show_statistics(callback.message, test_id=test_id)
+
+
+async def show_statistics(
+    message: Message,
+    test_type: str | None = None,
+    test_id: int | None = None,
+):
 
     async with async_session() as session:
 
-        test = await get_test_for_passing(session)
+        if test_id is None:
+            test = await get_test_for_passing(session)
+        else:
+            result = await session.execute(
+                select(Test).where(
+                    Test.id == test_id,
+                )
+            )
+            test = result.scalar_one_or_none()
 
         if not test:
             await message.answer(
@@ -2216,7 +2431,7 @@ async def show_statistics(message: Message, test_type: str | None = None):
                         stats["correct_answers"] += 1
 
         text = "📊 Статистика\n" if test_type is None else f"📊 Статистика - {test_types[0][1]}\n"
-        text += f"Тест №{test.id}\n"
+        text += f"Тест №{test.id} от {format_russian_date(test.test_date)}\n"
         text += "=" * 40 + "\n\n"
 
         for user_id in sorted(user_stats.keys()):
@@ -2226,6 +2441,7 @@ async def show_statistics(message: Message, test_type: str | None = None):
             admin_label = " (Админ)" if user.telegram_id in ADMIN_IDS else ""
 
             text += f"👤 {user.full_name}{admin_label}\n"
+            text += f"📍 {user.city or '-'}\n"
 
             for current_type, type_name in test_types:
                 stats = user_data["types"][current_type]
@@ -2234,7 +2450,6 @@ async def show_statistics(message: Message, test_type: str | None = None):
                 percent = (correct / total * 100) if total > 0 else 0
 
                 text += f"{type_name}\n"
-                text += f"📍 {user.city or '-'}\n"
 
                 if total > 0:
                     text += f"✅ Правильных: {correct}/{total} ({percent:.0f}%)\n"
@@ -2528,7 +2743,8 @@ async def export_test_results(message: Message, test_id: int):
             if user.id not in user_data:
                 user_data[user.id] = {
                     'user': user,
-                    'sessions': {}
+                    'sessions': {},
+                    'attempts': {},
                 }
 
             test_type = ts.test_type
@@ -2538,6 +2754,7 @@ async def export_test_results(message: Message, test_id: int):
                 continue
                 
             user_data[user.id]['sessions'][test_type] = {}
+            user_data[user.id]['attempts'][test_type] = ts.attempts
 
             # Получаем ответы для этой сессии, фильтруя по test_type
             attempt_result = await session.execute(
@@ -2656,15 +2873,16 @@ async def export_test_results(message: Message, test_id: int):
 
             # Строка "Итог"
             itog_row = row
+            last_question_row = row - 1
             ws.cell(row=itog_row, column=1, value="Итог")
             
             # Сумма Контроля
-            ws.cell(row=itog_row, column=2, value=f"=SUM(B5:B{itog_row-1})")
+            ws.cell(row=itog_row, column=2, value=f"=SUM(B5:B{last_question_row})")
             # Сумма Опыта
-            ws.cell(row=itog_row, column=3, value=f"=SUM(C5:C{itog_row-1})")
+            ws.cell(row=itog_row, column=3, value=f"=SUM(C5:C{last_question_row})")
             
             # Результат в строке Итог = сумма опыта / сумма контроля
-            result_formula = f"=IF(SUM(B5:B{itog_row-1})=0,0,SUM(C5:C{itog_row-1})/SUM(B5:B{itog_row-1}))"
+            result_formula = f"=IF(SUM(B5:B{last_question_row})=0,0,SUM(C5:C{last_question_row})/SUM(B5:B{last_question_row}))"
             ws.cell(row=itog_row, column=4, value=result_formula)
 
             # Форматирование строки Итог
@@ -2674,6 +2892,19 @@ async def export_test_results(message: Message, test_id: int):
                 cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
                 cell.border = border
                 cell.alignment = center_alignment
+
+            attempts_row = itog_row + 1
+            ws.cell(row=attempts_row, column=1, value="Попыток")
+            ws.cell(row=attempts_row, column=2, value=user_data[user_id]['attempts'].get('control', ""))
+            ws.cell(row=attempts_row, column=3, value=user_data[user_id]['attempts'].get('experience', ""))
+            ws.cell(row=attempts_row, column=4, value="")
+
+            for col in range(1, 5):
+                cell = ws.cell(row=attempts_row, column=col)
+                cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                cell.border = border
+                cell.alignment = center_alignment
+                cell.font = Font(bold=True)
 
             # Ширина колонок
             ws.column_dimensions['A'].width = 12
