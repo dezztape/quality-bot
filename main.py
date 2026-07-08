@@ -3384,9 +3384,24 @@ async def text_handler(
 # =========================
 
 async def setup_bot_commands():
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="start", description="Начать"),
-    ])
+    ]
+
+    for attempt in range(1, 4):
+        try:
+            await bot.set_my_commands(commands)
+            return
+        except Exception as e:
+            logger.warning(
+                "⚠️ Failed to set bot commands "
+                f"(attempt {attempt}/3): {e}"
+            )
+            await asyncio.sleep(attempt)
+
+    logger.warning(
+        "⚠️ Bot commands were not set, continuing startup"
+    )
 
 
 async def main():
