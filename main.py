@@ -81,8 +81,17 @@ MODERATOR_IDS = [
     for x in os.getenv("MODERATOR_IDS", "").split(",")
     if x
 ]
+STATISTICIAN_IDS = [
+    int(x)
+    for x in os.getenv("STATISTICIAN_IDS", "").split(",")
+    if x
+]
 
-logger.info(f"✅ Loaded {len(ADMIN_IDS)} admin(s) and {len(MODERATOR_IDS)} moderator(s)")
+logger.info(
+    f"✅ Loaded {len(ADMIN_IDS)} admin(s), "
+    f"{len(MODERATOR_IDS)} moderator(s), "
+    f"{len(STATISTICIAN_IDS)} statistician(s)"
+)
 
 
 # =========================
@@ -510,6 +519,14 @@ moderator_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+statistician_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="📁 Экспорт Excel")],
+    ],
+    resize_keyboard=True,
+)
+
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Пройти тест")],
@@ -551,8 +568,16 @@ async def is_moderator(user_id: int):
     return user_id in MODERATOR_IDS
 
 
+async def is_statistician(user_id: int):
+    return user_id in STATISTICIAN_IDS
+
+
 async def is_admin_or_moderator(user_id: int):
     return user_id in ADMIN_IDS or user_id in MODERATOR_IDS
+
+
+async def can_view_reports(user_id: int):
+    return user_id in ADMIN_IDS or user_id in STATISTICIAN_IDS
 
 
 async def get_user_by_tg_id(
@@ -782,6 +807,7 @@ async def start_handler(message: Message, state: FSMContext):
             not user.is_whitelisted
             and message.from_user.id not in ADMIN_IDS
             and message.from_user.id not in MODERATOR_IDS
+            and message.from_user.id not in STATISTICIAN_IDS
         ):
             await state.clear()
             await message.answer(
@@ -807,6 +833,8 @@ async def start_handler(message: Message, state: FSMContext):
             keyboard = admin_keyboard
         elif message.from_user.id in MODERATOR_IDS:
             keyboard = moderator_keyboard
+        elif message.from_user.id in STATISTICIAN_IDS:
+            keyboard = statistician_keyboard
         else:
             keyboard = user_keyboard
 
@@ -877,11 +905,14 @@ async def handle_user_city(message: Message, state: FSMContext):
         except:
             pass
 
-    keyboard = (
-        admin_keyboard
-        if message.from_user.id in ADMIN_IDS
-        else user_keyboard
-    )
+    if message.from_user.id in ADMIN_IDS:
+        keyboard = admin_keyboard
+    elif message.from_user.id in MODERATOR_IDS:
+        keyboard = moderator_keyboard
+    elif message.from_user.id in STATISTICIAN_IDS:
+        keyboard = statistician_keyboard
+    else:
+        keyboard = user_keyboard
 
     await message.answer(
         "✅ Добро пожаловать",
@@ -911,7 +942,7 @@ async def add_question_button(
 
 @dp.message(F.text == "📊 Статистика")
 async def results_button(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+    if not await can_view_reports(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
 
@@ -2194,6 +2225,13 @@ async def edit_answer_start(
 
 @dp.callback_query(F.data.startswith("stats_type:"))
 async def handle_stats_type(callback: CallbackQuery):
+    if not await can_view_reports(callback.from_user.id):
+        await callback.answer(
+            "У вас нет доступа",
+            show_alert=True,
+        )
+        return
+
     test_type = callback.data.split(":")[1]
     
     await callback.answer()
@@ -2204,7 +2242,7 @@ async def handle_stats_type(callback: CallbackQuery):
 
 @dp.message(Command("results"))
 async def results_command(message: Message, state: FSMContext):
-    if not await is_admin(message.from_user.id):
+    if not await can_view_reports(message.from_user.id):
         await message.answer("⛔ У вас нет доступа")
         return
 
@@ -2227,7 +2265,7 @@ async def show_statistics_menu(message: Message):
 
 @dp.callback_query(F.data.startswith("stats_date:"))
 async def handle_stats_date(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+    if not await can_view_reports(callback.from_user.id):
         await callback.answer(
             "У вас нет доступа",
             show_alert=True,
@@ -2262,7 +2300,7 @@ async def handle_stats_date(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "stats_available_days")
 async def handle_stats_available_days(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+    if not await can_view_reports(callback.from_user.id):
         await callback.answer(
             "У вас нет доступа",
             show_alert=True,
@@ -2302,7 +2340,7 @@ async def handle_stats_available_days(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("stats_test:"))
 async def handle_stats_test(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+    if not await can_view_reports(callback.from_user.id):
         await callback.answer(
             "У вас нет доступа",
             show_alert=True,
@@ -2341,11 +2379,17 @@ async def show_statistics(
             )
             return
 
-        # Получаем всех сотрудников (включая админов)
+        excluded_stats_ids = set(ADMIN_IDS + STATISTICIAN_IDS)
+
+        # Получаем сотрудников без админов и роли просмотра статистики
         users_result = await session.execute(
             select(User).order_by(User.full_name)
         )
-        all_users = users_result.scalars().all()
+        all_users = [
+            user
+            for user in users_result.scalars().all()
+            if user.telegram_id not in excluded_stats_ids
+        ]
 
         if not all_users:
             await message.answer(
@@ -2438,9 +2482,7 @@ async def show_statistics(
             user_data = user_stats[user_id]
             user = user_data["user"]
 
-            admin_label = " (Админ)" if user.telegram_id in ADMIN_IDS else ""
-
-            text += f"👤 {user.full_name}{admin_label}\n"
+            text += f"👤 {user.full_name}\n"
             text += f"📍 {user.city or '-'}\n"
 
             for current_type, type_name in test_types:
@@ -2448,8 +2490,9 @@ async def show_statistics(
                 total = stats["total_questions"]
                 correct = stats["correct_answers"]
                 percent = (correct / total * 100) if total > 0 else 0
+                type_icon = "📋" if current_type == "control" else "🧪"
 
-                text += f"{type_name}\n"
+                text += f"{type_icon} <b>{type_name}</b>\n"
 
                 if total > 0:
                     text += f"✅ Правильных: {correct}/{total} ({percent:.0f}%)\n"
@@ -2558,12 +2601,18 @@ async def publish_test_notification(callback: CallbackQuery):
         test.approved_at = datetime.now(timezone.utc)
         await session.commit()
 
-        users_result = await session.execute(
-            select(User).where(
-                User.telegram_id.notin_(ADMIN_IDS)
-            )
+        service_role_ids = set(
+            ADMIN_IDS + MODERATOR_IDS + STATISTICIAN_IDS
         )
-        users = users_result.scalars().all()
+
+        users_result = await session.execute(
+            select(User)
+        )
+        users = [
+            user
+            for user in users_result.scalars().all()
+            if user.telegram_id not in service_role_ids
+        ]
 
         success_count = 0
         for user in users:
@@ -2578,9 +2627,21 @@ async def publish_test_notification(callback: CallbackQuery):
             except:
                 pass
 
+        service_success_count = 0
+        for telegram_id in service_role_ids:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    "🔔 Тесты открыты для прохождения!"
+                )
+                service_success_count += 1
+            except:
+                pass
+
         await callback.message.answer(
             f"✅ Тест одобрен!\n\n"
-            f"📨 Уведомления отправлены: {success_count} сотрудникам"
+            f"📨 Уведомления отправлены: {success_count} сотрудникам\n"
+            f"🔔 Служебные уведомления отправлены: {service_success_count}"
         )
 
 
@@ -2590,7 +2651,7 @@ async def publish_test_notification(callback: CallbackQuery):
 @dp.message(F.text == "📁 Экспорт Excel")
 async def export_handler(message: Message):
 
-    if not await is_admin(message.from_user.id):
+    if not await can_view_reports(message.from_user.id):
         await message.answer(
             "⛔ У вас нет доступа"
         )
@@ -2610,7 +2671,7 @@ async def export_handler(message: Message):
 
 @dp.callback_query(F.data.startswith("export_date:"))
 async def handle_export_date(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+    if not await can_view_reports(callback.from_user.id):
         await callback.answer(
             "У вас нет доступа",
             show_alert=True,
@@ -2645,7 +2706,7 @@ async def handle_export_date(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "export_available_days")
 async def handle_export_available_days(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+    if not await can_view_reports(callback.from_user.id):
         await callback.answer(
             "У вас нет доступа",
             show_alert=True,
@@ -2685,7 +2746,7 @@ async def handle_export_available_days(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("export_test:"))
 async def handle_export_test(callback: CallbackQuery):
-    if not await is_admin(callback.from_user.id):
+    if not await can_view_reports(callback.from_user.id):
         await callback.answer(
             "У вас нет доступа",
             show_alert=True,
@@ -2730,8 +2791,10 @@ async def export_test_results(message: Message, test_id: int):
             )
             return
 
-        # Структурируем данные
+        # Структурируем данные для листов сотрудников и сводки ошибок
         user_data = {}
+        mistakes_summary = {}
+
         for ts in test_sessions:
             result_user = await session.execute(
                 select(User).where(User.id == ts.user_id)
@@ -2745,46 +2808,85 @@ async def export_test_results(message: Message, test_id: int):
                     'user': user,
                     'sessions': {},
                     'attempts': {},
+                    'attempt_history': {},
                 }
 
             test_type = ts.test_type
-            
+
             # Пропускаем, если уже обработали этот тип для этого пользователя
             if test_type in user_data[user.id]['sessions']:
                 continue
-                
+
             user_data[user.id]['sessions'][test_type] = {}
             user_data[user.id]['attempts'][test_type] = ts.attempts
+            user_data[user.id]['attempt_history'][test_type] = {}
 
-            # Получаем ответы для этой сессии, фильтруя по test_type
-            attempt_result = await session.execute(
+            attempts_result = await session.execute(
                 select(TestAttempt)
-                .where(
-                    TestAttempt.session_id == ts.id,
-                    TestAttempt.passed == True,
+                .where(TestAttempt.session_id == ts.id)
+                .order_by(TestAttempt.attempt_number)
+            )
+            attempts = attempts_result.scalars().all()
+
+            passed_attempt = None
+
+            for attempt in attempts:
+                if attempt.passed:
+                    passed_attempt = attempt
+
+                answers_result = await session.execute(
+                    select(Answer, Question)
+                    .join(Question, Question.id == Answer.question_id)
+                    .where(Answer.attempt_id == attempt.id)
+                    .where(Question.test_id == test.id)
+                    .where(Question.test_type == test_type)
+                    .order_by(Question.question_order)
                 )
-                .order_by(TestAttempt.attempt_number.desc())
-            )
-            attempt = attempt_result.scalars().first()
+                answers = answers_result.all()
 
-            if not attempt:
-                continue
+                attempt_answers = {}
+                for answer, question in answers:
+                    q_order = question.question_order
+                    attempt_answers[q_order] = {
+                        "answer": answer.answer,
+                        "is_correct": answer.is_correct,
+                    }
 
-            answers_result = await session.execute(
-                select(Answer, Question)
-                .join(Question, Question.id == Answer.question_id)
-                .where(Answer.attempt_id == attempt.id)
-                .where(Question.test_id == test.id)
-                .where(Question.test_type == test_type)
-                .order_by(Question.question_order)
-            )
-            answers = answers_result.all()
+                    summary_key = (question.test_type, q_order)
+                    if summary_key not in mistakes_summary:
+                        mistakes_summary[summary_key] = {
+                            "test_type": question.test_type,
+                            "question_order": q_order,
+                            "mistakes": 0,
+                            "total": 0,
+                            "users": set(),
+                        }
 
-            for answer, question in answers:
-                q_order = question.question_order
-                if q_order not in user_data[user.id]['sessions'][test_type]:
-                    user_data[user.id]['sessions'][test_type][q_order] = None
-                user_data[user.id]['sessions'][test_type][q_order] = answer.answer
+                    mistakes_summary[summary_key]["total"] += 1
+                    if not answer.is_correct:
+                        mistakes_summary[summary_key]["mistakes"] += 1
+                        mistakes_summary[summary_key]["users"].add(
+                            user.full_name
+                        )
+
+                user_data[user.id]['attempt_history'][test_type][
+                    attempt.attempt_number
+                ] = attempt_answers
+
+            if passed_attempt:
+                final_answers_result = await session.execute(
+                    select(Answer, Question)
+                    .join(Question, Question.id == Answer.question_id)
+                    .where(Answer.attempt_id == passed_attempt.id)
+                    .where(Question.test_id == test.id)
+                    .where(Question.test_type == test_type)
+                    .order_by(Question.question_order)
+                )
+                final_answers = final_answers_result.all()
+
+                for answer, question in final_answers:
+                    q_order = question.question_order
+                    user_data[user.id]['sessions'][test_type][q_order] = answer.answer
 
         # Создаем Excel файл
         filename = f"results_{test.id}_{test.test_date.strftime('%d_%m_%Y')}.xlsx"
@@ -2804,6 +2906,38 @@ async def export_test_results(message: Message, test_id: int):
             top=Side(style="thin"),
             bottom=Side(style="thin")
         )
+        final_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        attempts_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        attempt_title_fill = PatternFill(start_color="B4A7D6", end_color="B4A7D6", fill_type="solid")
+        correct_fill = PatternFill(start_color="C6E0B4", end_color="C6E0B4", fill_type="solid")
+        incorrect_fill = PatternFill(start_color="D99694", end_color="D99694", fill_type="solid")
+        summary_warning_fill = PatternFill(start_color="FCE4D6", end_color="FCE4D6", fill_type="solid")
+        summary_ok_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+
+        def make_unique_sheet_name(base_name: str) -> str:
+            clean_name = "".join(
+                ch for ch in base_name if ch not in r'[]:*?/\\'
+            ).strip() or "User"
+            clean_name = clean_name[:31]
+            if clean_name not in wb.sheetnames:
+                return clean_name
+
+            counter = 2
+            while True:
+                suffix = f" {counter}"
+                candidate = f"{clean_name[:31 - len(suffix)]}{suffix}"
+                if candidate not in wb.sheetnames:
+                    return candidate
+                counter += 1
+
+        def write_header_row(ws, row_number: int, headers: list[str]):
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=row_number, column=col)
+                cell.value = header
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = center_alignment
+                cell.border = border
 
         # Создаем лист для каждого пользователя
         for user_id in sorted(user_data.keys()):
@@ -2811,7 +2945,9 @@ async def export_test_results(message: Message, test_id: int):
             sessions = user_data[user_id]['sessions']
 
             # Ограничиваем длину названия листа до 31 символа
-            sheet_name = user.full_name[:31] if user.full_name else "User"
+            sheet_name = make_unique_sheet_name(
+                user.full_name if user.full_name else "User"
+            )
             
             # Если это первый лист, используем дефолтный, иначе создаём новый
             if not sheets_created:
@@ -2832,14 +2968,11 @@ async def export_test_results(message: Message, test_id: int):
             ws['A2'].font = Font(bold=True, size=11)
 
             # Заголовки таблицы
-            headers = ["№", "Контроль", "Опыт", "Результат"]
-            for col, header in enumerate(headers, 1):
-                cell = ws.cell(row=4, column=col)
-                cell.value = header
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = center_alignment
-                cell.border = border
+            write_header_row(
+                ws,
+                4,
+                ["№", "Контроль", "Опыт", "Результат"],
+            )
 
             # Данные
             row = 5
@@ -2889,7 +3022,7 @@ async def export_test_results(message: Message, test_id: int):
             ws.cell(row=itog_row, column=1).font = Font(bold=True)
             for col in range(1, 5):
                 cell = ws.cell(row=itog_row, column=col)
-                cell.fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+                cell.fill = final_fill
                 cell.border = border
                 cell.alignment = center_alignment
 
@@ -2901,16 +3034,141 @@ async def export_test_results(message: Message, test_id: int):
 
             for col in range(1, 5):
                 cell = ws.cell(row=attempts_row, column=col)
-                cell.fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+                cell.fill = attempts_fill
                 cell.border = border
                 cell.alignment = center_alignment
                 cell.font = Font(bold=True)
+
+            attempt_history = user_data[user_id]['attempt_history']
+            all_attempt_numbers = sorted(set(
+                list(attempt_history.get('control', {}).keys()) +
+                list(attempt_history.get('experience', {}).keys())
+            ))
+
+            row = attempts_row + 3
+            for attempt_number in all_attempt_numbers:
+                ws.merge_cells(
+                    start_row=row,
+                    start_column=1,
+                    end_row=row,
+                    end_column=3,
+                )
+                title_cell = ws.cell(row=row, column=1)
+                title_cell.value = f"Попытка #{attempt_number}"
+                title_cell.fill = attempt_title_fill
+                title_cell.alignment = center_alignment
+                title_cell.border = border
+                for col in range(2, 4):
+                    cell = ws.cell(row=row, column=col)
+                    cell.fill = attempt_title_fill
+                    cell.border = border
+
+                row += 1
+                write_header_row(ws, row, ["№", "Контроль", "Опыт"])
+
+                control_attempt = attempt_history.get('control', {}).get(
+                    attempt_number,
+                    {},
+                )
+                experience_attempt = attempt_history.get('experience', {}).get(
+                    attempt_number,
+                    {},
+                )
+                attempt_questions = sorted(set(
+                    list(control_attempt.keys()) +
+                    list(experience_attempt.keys())
+                ))
+
+                row += 1
+                for q_num in attempt_questions:
+                    ws.cell(row=row, column=1, value=q_num)
+
+                    control_data = control_attempt.get(q_num)
+                    experience_data = experience_attempt.get(q_num)
+
+                    if control_data:
+                        cell = ws.cell(
+                            row=row,
+                            column=2,
+                            value=control_data["answer"],
+                        )
+                        cell.fill = correct_fill if control_data["is_correct"] else incorrect_fill
+
+                    if experience_data:
+                        cell = ws.cell(
+                            row=row,
+                            column=3,
+                            value=experience_data["answer"],
+                        )
+                        cell.fill = correct_fill if experience_data["is_correct"] else incorrect_fill
+
+                    for col in range(1, 4):
+                        cell = ws.cell(row=row, column=col)
+                        cell.alignment = center_alignment
+                        cell.border = border
+
+                    row += 1
+
+                row += 2
 
             # Ширина колонок
             ws.column_dimensions['A'].width = 12
             ws.column_dimensions['B'].width = 12
             ws.column_dimensions['C'].width = 12
             ws.column_dimensions['D'].width = 12
+
+        summary_sheet_name = make_unique_sheet_name("Ошибки по вопросам")
+        ws = wb.create_sheet(title=summary_sheet_name)
+
+        ws.merge_cells('A1:F1')
+        ws['A1'] = f"Сводка ошибок по тесту №{test.id} {test_date_label}"
+        ws['A1'].font = Font(bold=True, size=12)
+        ws['A1'].alignment = Alignment(horizontal="left", vertical="center")
+
+        write_header_row(
+            ws,
+            3,
+            ["№ вопроса", "Тип", "Ошибок", "Всего ответов", "% ошибок", "Кто ошибся"],
+        )
+
+        summary_rows = sorted(
+            mistakes_summary.values(),
+            key=lambda item: (
+                -item["mistakes"],
+                item["test_type"],
+                item["question_order"],
+            )
+        )
+
+        row = 4
+        for item in summary_rows:
+            total = item["total"]
+            mistakes = item["mistakes"]
+            percent = mistakes / total if total else 0
+            users = ", ".join(sorted(item["users"]))
+
+            ws.cell(row=row, column=1, value=item["question_order"])
+            ws.cell(row=row, column=2, value=get_test_type_name(item["test_type"]))
+            ws.cell(row=row, column=3, value=mistakes)
+            ws.cell(row=row, column=4, value=total)
+            ws.cell(row=row, column=5, value=percent)
+            ws.cell(row=row, column=6, value=users)
+
+            fill = summary_warning_fill if mistakes else summary_ok_fill
+            for col in range(1, 7):
+                cell = ws.cell(row=row, column=col)
+                cell.fill = fill
+                cell.border = border
+                cell.alignment = center_alignment if col < 6 else Alignment(wrap_text=True, vertical="center")
+            ws.cell(row=row, column=5).number_format = "0%"
+            row += 1
+
+        ws.column_dimensions['A'].width = 14
+        ws.column_dimensions['B'].width = 14
+        ws.column_dimensions['C'].width = 12
+        ws.column_dimensions['D'].width = 14
+        ws.column_dimensions['E'].width = 12
+        ws.column_dimensions['F'].width = 50
 
         wb.save(filename)
 
