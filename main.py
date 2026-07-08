@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramServerError
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
 
@@ -3408,10 +3409,21 @@ async def main():
 
     await create_db()
     await setup_bot_commands()
-    
-    logger.info("🚀 Bot started, polling messages...")
 
-    await dp.start_polling(bot)
+    retry_delay = 5
+
+    while True:
+        try:
+            logger.info("🚀 Bot started, polling messages...")
+            await dp.start_polling(bot)
+            break
+        except TelegramServerError as e:
+            logger.warning(
+                "⚠️ Telegram server error during polling startup: "
+                f"{e}. Retrying in {retry_delay} seconds..."
+            )
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
 
 
 if __name__ == "__main__":
