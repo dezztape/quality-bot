@@ -1,8 +1,10 @@
 import asyncio
 import os
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -10,7 +12,7 @@ from openpyxl.utils import get_column_letter
 
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError, TelegramServerError
 from aiogram.filters import Command
@@ -72,6 +74,7 @@ logger.info("🤖 Quality Bot starting...")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 REDIS_URL = os.getenv("REDIS_URL")
+SLOW_UPDATE_LOG_SECONDS = float(os.getenv("SLOW_UPDATE_LOG_SECONDS", "2"))
 ADMIN_IDS = [
     int(x)
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -107,6 +110,46 @@ bot = Bot(
 )
 
 dp = Dispatcher(storage=MemoryStorage())
+
+
+class SlowUpdateLoggerMiddleware(BaseMiddleware):
+    def __init__(self, threshold_seconds: float):
+        self.threshold_seconds = threshold_seconds
+
+    async def __call__(
+        self,
+        handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: dict[str, Any],
+    ) -> Any:
+        started_at = time.perf_counter()
+        try:
+            return await handler(event, data)
+        finally:
+            duration = time.perf_counter() - started_at
+            if duration >= self.threshold_seconds:
+                event_type = type(event).__name__
+                user_id = getattr(getattr(event, "from_user", None), "id", None)
+                chat_id = getattr(getattr(event, "chat", None), "id", None)
+                details = ""
+
+                if isinstance(event, Message):
+                    text = event.text or event.caption or ""
+                    details = text[:120]
+                elif isinstance(event, CallbackQuery):
+                    chat_id = getattr(getattr(event.message, "chat", None), "id", None)
+                    details = event.data or ""
+
+                logger.warning(
+                    "🐢 Slow update handled: "
+                    f"type={event_type}, user_id={user_id}, chat_id={chat_id}, "
+                    f"duration_ms={duration * 1000:.0f}, details={details!r}"
+                )
+
+
+slow_update_logger = SlowUpdateLoggerMiddleware(SLOW_UPDATE_LOG_SECONDS)
+dp.message.middleware(slow_update_logger)
+dp.callback_query.middleware(slow_update_logger)
 
 if REDIS_URL:
     logger.info("📝 Redis URL configured (will use for production)")
