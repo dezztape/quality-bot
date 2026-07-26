@@ -2427,7 +2427,9 @@ async def show_statistics(
 
         # Получаем сотрудников без админов и роли просмотра статистики
         users_result = await session.execute(
-            select(User).order_by(User.full_name)
+            select(User)
+            .where(User.is_whitelisted == True)
+            .order_by(User.full_name)
         )
         all_users = [
             user
@@ -2841,7 +2843,10 @@ async def export_test_results(message: Message, test_id: int):
 
         for ts in test_sessions:
             result_user = await session.execute(
-                select(User).where(User.id == ts.user_id)
+                select(User).where(
+                    User.id == ts.user_id,
+                    User.is_whitelisted == True,
+                )
             )
             user = result_user.scalar_one_or_none()
             if not user:
@@ -2933,6 +2938,12 @@ async def export_test_results(message: Message, test_id: int):
                     user_data[user.id]['sessions'][test_type][q_order] = answer.answer
 
         # Создаем Excel файл
+        if not user_data:
+            await message.answer(
+                "вќЊ РќРµС‚ РґР°РЅРЅС‹С…"
+            )
+            return
+
         filename = f"results_{test.id}_{test.test_date.strftime('%d_%m_%Y')}.xlsx"
         test_date_label = format_russian_date(test.test_date)
         wb = Workbook()
