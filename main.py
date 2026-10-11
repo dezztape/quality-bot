@@ -2592,40 +2592,31 @@ async def show_statistics(
                 if ts.completed:
                     stats["completed_tests"] += 1
 
+                # Для ошибок учитываем ответы всех попыток, а не только
+                # последней успешной. Иначе 6 попыток с ошибками в первых
+                # пяти выглядели бы как «6 попыток, 0 ошибок».
                 attempt_query = select(TestAttempt).where(
                     TestAttempt.session_id == ts.id,
                 )
-
-                if ts.completed:
-                    attempt_query = attempt_query.where(
-                        TestAttempt.passed == True
-                    )
-                else:
-                    attempt_query = attempt_query.where(
-                        TestAttempt.completed_at.is_(None)
-                    )
-
                 attempt_result = await session.execute(
-                    attempt_query.order_by(TestAttempt.attempt_number.desc())
+                    attempt_query.order_by(TestAttempt.attempt_number)
                 )
-                attempt = attempt_result.scalars().first()
+                attempts = attempt_result.scalars().all()
 
-                if not attempt:
-                    continue
+                for attempt in attempts:
+                    answers_result = await session.execute(
+                        select(Answer, Question)
+                        .join(Question, Question.id == Answer.question_id)
+                        .where(Answer.attempt_id == attempt.id)
+                        .where(Question.test_id == current_test.id)
+                        .where(Question.test_type == current_type)
+                    )
+                    answers_data = answers_result.all()
 
-                answers_result = await session.execute(
-                    select(Answer, Question)
-                    .join(Question, Question.id == Answer.question_id)
-                    .where(Answer.attempt_id == attempt.id)
-                    .where(Question.test_id == current_test.id)
-                    .where(Question.test_type == current_type)
-                )
-                answers_data = answers_result.all()
-
-                for answer, question in answers_data:
-                    stats["total_questions"] += 1
-                    if answer.is_correct:
-                        stats["correct_answers"] += 1
+                    for answer, question in answers_data:
+                        stats["total_questions"] += 1
+                        if answer.is_correct:
+                            stats["correct_answers"] += 1
 
         selected_label = (
             format_russian_date(tests[0].test_date)
