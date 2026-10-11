@@ -2305,6 +2305,7 @@ async def results_command(message: Message, state: FSMContext):
 
 async def show_statistics_menu(message: Message):
     kb = InlineKeyboardBuilder()
+    kb.button(text="👤 По сотруднику", callback_data="stats_by_employee")
     kb.button(text="📅 Сегодня", callback_data="stats_range:today")
     kb.button(text="↩️ Вчера", callback_data="stats_range:yesterday")
     kb.button(text="🗓 Выбрать день", callback_data="stats_custom_date")
@@ -2317,6 +2318,158 @@ async def show_statistics_menu(message: Message):
         "Выберите период для просмотра статистики:",
         reply_markup=kb.as_markup(),
     )
+
+
+@dp.callback_query(F.data == "stats_by_employee")
+async def handle_stats_by_employee(callback: CallbackQuery):
+    if not await can_view_reports(callback.from_user.id):
+        await callback.answer("У вас нет доступа", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.delete()
+
+    excluded_stats_ids = set(ADMIN_IDS + STATISTICIAN_IDS)
+    async with async_session() as session:
+        users_result = await session.execute(
+            select(User)
+            .where(User.is_whitelisted == True)
+            .order_by(User.city, User.full_name)
+        )
+        employees = [
+            user for user in users_result.scalars().all()
+            if user.telegram_id not in excluded_stats_ids
+        ]
+
+    if not employees:
+        await callback.message.answer("❌ Сотрудники не найдены")
+        return
+
+    kb = InlineKeyboardBuilder()
+    for employee in employees:
+        employee_name = escape(employee.full_name or "Без имени")
+        employee_city = escape(employee.city or "Без города")
+        kb.button(
+            text=f"{employee_name} — {employee_city}",
+            callback_data=f"stats_employee:{employee.id}",
+        )
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "Выберите сотрудника для просмотра статистики за текущий месяц:",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("stats_employee:"))
+async def handle_stats_employee(callback: CallbackQuery):
+    if not await can_view_reports(callback.from_user.id):
+        await callback.answer("У вас нет доступа", show_alert=True)
+        return
+
+    employee_id = int(callback.data.split(":", 1)[1])
+    await callback.answer()
+    await callback.message.delete()
+
+    today = date.today()
+    month_start = today.replace(day=1)
+    daily_stats = defaultdict(lambda: {"total": 0, "correct": 0, "attempts": 0})
+
+    async with async_session() as session:
+        employee_result = await session.execute(
+            select(User).where(User.id == employee_id)
+        )
+        employee = employee_result.scalar_one_or_none()
+        if not employee:
+            await callback.message.answer("❌ Сотрудник не найден")
+            return
+
+        sessions_result = await session.execute(
+            select(TestSession, Test)
+            .join(Test, Test.id == TestSession.test_id)
+            .where(TestSession.user_id == employee_id)
+            .where(Test.test_date >= month_start)
+            .where(Test.test_date <= today)
+        )
+
+        for test_session, test in sessions_result.all():
+            day_stats = daily_stats[test.test_date]
+            day_stats["attempts"] += test_session.attempts or 1
+
+            attempts_result = await session.execute(
+                select(TestAttempt)
+                .where(TestAttempt.session_id == test_session.id)
+            )
+            attempts = attempts_result.scalars().all()
+
+            for attempt in attempts:
+                answers_result = await session.execute(
+                    select(Answer).where(Answer.attempt_id == attempt.id)
+                )
+                answers = answers_result.scalars().all()
+                day_stats["total"] += len(answers)
+                day_stats["correct"] += sum(
+                    int(answer.is_correct) for answer in answers
+                )
+
+    employee_name = escape(employee.full_name or "Без имени")
+    employee_city = escape(employee.city or "Без города")
+    text = (
+        f"📊 <b>{employee_name}</b>\n"
+        f"🏙 {employee_city}\n"
+        f"📅 Статистика за {today.strftime('%m.%Y')}\n"
+        f"{'=' * 38}\n\n"
+    )
+
+    active_days = []
+    current_day = month_start
+    while current_day <= today:
+        stats = daily_stats.get(current_day)
+        if stats and stats["total"]:
+            accuracy = stats["correct"] / stats["total"] * 100
+            errors = stats["total"] - stats["correct"]
+            text += (
+                f"📌 {current_day.strftime('%d.%m.%Y')}: "
+                f"точность {accuracy:.0f}%, "
+                f"ошибок {errors}, "
+                f"попыток {stats['attempts']}\n"
+            )
+            active_days.append((current_day, accuracy, errors, stats["attempts"]))
+        else:
+            text += f"📌 {current_day.strftime('%d.%m.%Y')}: нет прохождения\n"
+        current_day += timedelta(days=1)
+
+    if active_days:
+        first_day = active_days[0]
+        last_day = active_days[-1]
+        accuracy_delta = last_day[1] - first_day[1]
+        errors_delta = last_day[2] - first_day[2]
+        attempts_delta = last_day[3] - first_day[3]
+        trend = "📈 Есть прогресс" if accuracy_delta > 0 else (
+            "📉 Точность снизилась" if accuracy_delta < 0 else "➡️ Точность без изменений"
+        )
+        text += (
+            f"\n<b>Динамика обучения</b>\n"
+            f"{trend}\n"
+            f"Точность: {accuracy_delta:+.0f} п.п.\n"
+            f"Ошибки: {errors_delta:+d}\n"
+            f"Попытки: {attempts_delta:+d}\n"
+        )
+    else:
+        text += "\nЗа текущий месяц сотрудник тесты не проходил."
+
+    chunks = []
+    current_chunk = ""
+    for line in text.splitlines(keepends=True):
+        if current_chunk and len(current_chunk) + len(line) > 3900:
+            chunks.append(current_chunk)
+            current_chunk = ""
+        current_chunk += line
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for chunk in chunks:
+        await callback.message.answer(chunk)
 
 
 def parse_stats_date(value: str) -> date | None:
