@@ -4,6 +4,7 @@ import logging
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -2640,10 +2641,10 @@ async def show_statistics(
             users_by_city[user_data["user"].city or "Без города"].append(user_data)
 
         for city in sorted(users_by_city):
-            text += f"🏙 <b>{city}</b>\n"
+            text += f"🏙 <b>{escape(city)}</b>\n"
             for user_data in sorted(users_by_city[city], key=lambda item: item["user"].full_name):
                 user = user_data["user"]
-                text += f"   👤 {user.full_name}\n"
+                text += f"   👤 {escape(user.full_name)}\n"
 
                 for current_type, type_name in test_types:
                     stats = user_data["types"][current_type]
@@ -2660,10 +2661,20 @@ async def show_statistics(
 
             text += "-" * 40 + "\n"
 
-        if len(text) > 4000:
-            text = text[:4000]
+        # Telegram ограничивает сообщение 4096 символами. Разбиваем по строкам,
+        # чтобы не обрезать HTML-тег <b> посередине и не получать Bad Request.
+        chunks = []
+        current_chunk = ""
+        for line in text.splitlines(keepends=True):
+            if current_chunk and len(current_chunk) + len(line) > 3900:
+                chunks.append(current_chunk)
+                current_chunk = ""
+            current_chunk += line
+        if current_chunk:
+            chunks.append(current_chunk)
 
-        await message.answer(text)
+        for chunk in chunks:
+            await message.answer(chunk)
 
 
 
