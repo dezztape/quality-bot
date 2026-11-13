@@ -2593,7 +2593,7 @@ async def handle_stats_completion_status(callback: CallbackQuery):
             ):
                 test_session = sessions_by_user_type.get((employee.id, test_type))
                 if not test_session:
-                    text += f"{type_icon} {type_label}: — Не начинал\n"
+                    text += f"{type_icon} {type_label}: ❌ Не начинал\n"
                 elif test_session.completed:
                     text += f"{type_icon} {type_label}: ✅ Завершён\n"
                 else:
@@ -3105,22 +3105,34 @@ async def show_statistics(
                     percent = (correct / total * 100) if total > 0 else 0
                     type_icon = "📋" if current_type == "control" else "🧪"
 
-                    text += f"      {type_icon} <b>{type_name}</b>: точность {percent:.0f}%, ошибок {errors}, попыток {stats['attempts']}\n"
-                    if show_test_times and stats["started_at"]:
-                        started_at = to_astana_time(stats["started_at"])
-                        completed_at = to_astana_time(stats["completed_at"])
-                        started_label = started_at.strftime("%H:%M")
-                        completed_label = (
-                            completed_at.strftime("%H:%M")
-                            if completed_at else "не завершён"
-                        )
+                    if show_test_times:
+                        text += f"      {type_icon} <b>{type_name}</b>\n"
+                        if stats["started_at"]:
+                            started_at = to_astana_time(stats["started_at"])
+                            completed_at = to_astana_time(stats["completed_at"])
+                            started_label = started_at.strftime("%H:%M")
+                            completed_label = (
+                                completed_at.strftime("%H:%M")
+                                if completed_at else "не завершён"
+                            )
+                            text += (
+                                f"      🕘 {started_label}–{completed_label} · "
+                                f"{format_duration(stats['started_at'], stats['completed_at'])}\n"
+                            )
+                        text += f"      ✅ Точность: {percent:.0f}%\n"
                         text += (
-                            f"      🕘 {started_label}–{completed_label} · "
-                            f"{format_duration(stats['started_at'], stats['completed_at'])}\n"
+                            f"      ❌ Ошибки: {errors} · "
+                            f"🔄 Попытки: {stats['attempts']}\n"
                         )
-                    text += f"      Завершено тестов: {stats['completed_tests']}\n"
-
-                    text += f"      {stats['status']}\n"
+                    else:
+                        text += (
+                            f"      {type_icon} <b>{type_name}</b>: "
+                            f"точность {percent:.0f}%, ошибок {errors}, "
+                            f"попыток {stats['attempts']}\n"
+                        )
+                    if not show_test_times:
+                        text += f"      Завершено тестов: {stats['completed_tests']}\n"
+                        text += f"      {stats['status']}\n"
 
             text += "-" * 40 + "\n"
 
