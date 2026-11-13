@@ -2477,6 +2477,7 @@ async def results_command(message: Message, state: FSMContext):
 async def show_statistics_menu(message: Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="👤 По сотруднику", callback_data="stats_by_employee")
+    kb.button(text="📋 Статус прохождения", callback_data="stats_completion_status")
     kb.button(text="📅 Сегодня", callback_data="stats_range:today")
     kb.button(text="↩️ Вчера", callback_data="stats_range:yesterday")
     kb.button(text="🗓 Выбрать день", callback_data="stats_custom_date")
@@ -2532,6 +2533,92 @@ async def handle_stats_by_employee(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "stats_completion_status")
+async def handle_stats_completion_status(callback: CallbackQuery):
+    if not await can_view_reports(callback.from_user.id):
+        await callback.answer("У вас нет доступа", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.delete()
+
+    today = date.today()
+    excluded_stats_ids = set(ADMIN_IDS + STATISTICIAN_IDS)
+
+    async with async_session() as session:
+        test_result = await session.execute(
+            select(Test).where(Test.test_date == today)
+        )
+        test = test_result.scalar_one_or_none()
+        if not test:
+            await callback.message.answer(
+                f"❌ Тест за {format_russian_date(today)} не найден"
+            )
+            return
+
+        users_result = await session.execute(
+            select(User)
+            .where(User.is_whitelisted == True)
+            .order_by(User.city, User.full_name)
+        )
+        employees = [
+            user for user in users_result.scalars().all()
+            if user.telegram_id not in excluded_stats_ids
+        ]
+
+        sessions_result = await session.execute(
+            select(TestSession).where(TestSession.test_id == test.id)
+        )
+        sessions_by_user_type = {
+            (test_session.user_id, test_session.test_type): test_session
+            for test_session in sessions_result.scalars().all()
+        }
+
+    users_by_city = defaultdict(list)
+    for employee in employees:
+        users_by_city[employee.city or "Без города"].append(employee)
+
+    text = (
+        "📋 <b>Статус прохождения</b>\n"
+        f"📅 {format_russian_date(today)}\n\n"
+    )
+
+    for city in sorted(users_by_city):
+        text += f"🏙 <b>{escape(city)}</b>\n\n"
+        for employee in users_by_city[city]:
+            text += f"👤 {escape(employee.full_name or 'Без имени')}\n"
+            for test_type, type_label, type_icon in (
+                ("control", "Контроль", "📋"),
+                ("experience", "Опыт", "🧪"),
+            ):
+                test_session = sessions_by_user_type.get((employee.id, test_type))
+                if not test_session:
+                    text += f"{type_icon} {type_label}: — Не начинал\n"
+                elif test_session.completed:
+                    text += f"{type_icon} {type_label}: ✅ Завершён\n"
+                else:
+                    started_at = to_astana_time(test_session.started_at)
+                    started_label = started_at.strftime("%H:%M") if started_at else "—"
+                    text += (
+                        f"{type_icon} {type_label}: ⏳ В процессе\n"
+                        f"🕘 Начало: {started_label}\n"
+                    )
+            text += "\n"
+
+    chunks = []
+    current_chunk = ""
+    for line in text.splitlines(keepends=True):
+        if current_chunk and len(current_chunk) + len(line) > 3900:
+            chunks.append(current_chunk)
+            current_chunk = ""
+        current_chunk += line
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for chunk in chunks:
+        await callback.message.answer(chunk)
+
+
 @dp.callback_query(F.data.startswith("stats_employee:"))
 async def handle_stats_employee(callback: CallbackQuery):
     if not await can_view_reports(callback.from_user.id):
@@ -2554,8 +2641,6 @@ async def handle_stats_employee(callback: CallbackQuery):
                     "total": 0,
                     "correct": 0,
                     "attempts": 0,
-                    "started_at": None,
-                    "completed_at": None,
                 }
             ),
         }
@@ -2583,17 +2668,6 @@ async def handle_stats_employee(callback: CallbackQuery):
             day_stats["attempts"] += test_session.attempts or 1
             type_stats = day_stats["types"][test_session.test_type]
             type_stats["attempts"] += test_session.attempts or 1
-
-            if (
-                type_stats["started_at"] is None
-                or test_session.started_at < type_stats["started_at"]
-            ):
-                type_stats["started_at"] = test_session.started_at
-            if test_session.completed_at and (
-                type_stats["completed_at"] is None
-                or test_session.completed_at > type_stats["completed_at"]
-            ):
-                type_stats["completed_at"] = test_session.completed_at
 
             attempts_result = await session.execute(
                 select(TestAttempt)
@@ -2648,17 +2722,8 @@ async def handle_stats_employee(callback: CallbackQuery):
                     type_stats["correct"] / type_stats["total"] * 100
                 )
                 type_errors = type_stats["total"] - type_stats["correct"]
-                started_at = to_astana_time(type_stats["started_at"])
-                completed_at = to_astana_time(type_stats["completed_at"])
-                started_label = started_at.strftime("%H:%M") if started_at else "—"
-                completed_label = (
-                    completed_at.strftime("%H:%M") if completed_at else "не завершён"
-                )
                 text += (
-                    f"   {type_icon} {type_label}: "
-                    f"{started_label}–{completed_label}, "
-                    f"{format_duration(type_stats['started_at'], type_stats['completed_at'])}\n"
-                    f"      точность {type_accuracy:.0f}%, "
+                    f"   {type_icon} {type_label}: точность {type_accuracy:.0f}%, "
                     f"ошибок {type_errors}, "
                     f"попыток {type_stats['attempts']}\n"
                 )
@@ -2908,6 +2973,10 @@ async def show_statistics(
             return
 
         test_ids = [item.id for item in tests]
+        show_test_times = (
+            test_id is not None
+            or (start_date is not None and end_date is not None and start_date == end_date)
+        )
         excluded_stats_ids = set(ADMIN_IDS + STATISTICIAN_IDS)
 
         # Получаем сотрудников без админов и роли просмотра статистики
@@ -2946,6 +3015,8 @@ async def show_statistics(
                         "correct_answers": 0,
                         "attempts": 0,
                         "completed_tests": 0,
+                        "started_at": None,
+                        "completed_at": None,
                         "status": "❌ Не начат",
                     }
                     for current_type, _ in test_types
@@ -2972,6 +3043,14 @@ async def show_statistics(
                 stats["attempts"] += ts.attempts or 1
                 if ts.completed:
                     stats["completed_tests"] += 1
+                if show_test_times:
+                    if stats["started_at"] is None or ts.started_at < stats["started_at"]:
+                        stats["started_at"] = ts.started_at
+                    if ts.completed_at and (
+                        stats["completed_at"] is None
+                        or ts.completed_at > stats["completed_at"]
+                    ):
+                        stats["completed_at"] = ts.completed_at
 
                 # Для ошибок учитываем ответы всех попыток, а не только
                 # последней успешной. Иначе 6 попыток с ошибками в первых
@@ -3027,6 +3106,18 @@ async def show_statistics(
                     type_icon = "📋" if current_type == "control" else "🧪"
 
                     text += f"      {type_icon} <b>{type_name}</b>: точность {percent:.0f}%, ошибок {errors}, попыток {stats['attempts']}\n"
+                    if show_test_times and stats["started_at"]:
+                        started_at = to_astana_time(stats["started_at"])
+                        completed_at = to_astana_time(stats["completed_at"])
+                        started_label = started_at.strftime("%H:%M")
+                        completed_label = (
+                            completed_at.strftime("%H:%M")
+                            if completed_at else "не завершён"
+                        )
+                        text += (
+                            f"      🕘 {started_label}–{completed_label} · "
+                            f"{format_duration(stats['started_at'], stats['completed_at'])}\n"
+                        )
                     text += f"      Завершено тестов: {stats['completed_tests']}\n"
 
                     text += f"      {stats['status']}\n"
