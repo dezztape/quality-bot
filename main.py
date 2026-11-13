@@ -166,6 +166,7 @@ else:
 
 DB_SCHEMA = "quality_bot"
 INIT_SCHEMA_SQL = Path(__file__).resolve().parent / "db" / "init_schema.sql"
+ASTANA_TIMEZONE = timezone(timedelta(hours=5))
 
 # Преобразуем DATABASE_URL для asyncpg если нужно
 # Railway отправляет postgresql://, нам нужен postgresql+asyncpg://
@@ -827,6 +828,31 @@ def format_russian_date(value: date) -> str:
 
 def get_test_type_name(test_type: str) -> str:
     return "Контроль" if test_type == "control" else "Опыт"
+
+
+def to_astana_time(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    # PostgreSQL возвращает TIMESTAMPTZ с timezone. Если старые данные
+    # оказались naive, трактуем их как UTC, чтобы не показать неверное время.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(ASTANA_TIMEZONE)
+
+
+def format_duration(started_at: datetime | None, completed_at: datetime | None) -> str:
+    started = to_astana_time(started_at)
+    completed = to_astana_time(completed_at)
+    if not started or not completed:
+        return "—"
+
+    minutes = max(0, int((completed - started).total_seconds() // 60))
+    if minutes < 1:
+        return "менее 1 мин"
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} ч {remaining_minutes} мин" if remaining_minutes else f"{hours} ч"
+    return f"{minutes} мин"
 
 
 # =========================
@@ -1972,6 +1998,12 @@ async def admin_view_question(
             callback_data=f"edit_ans:{q.id}"
         )
 
+        if await is_admin(callback.from_user.id):
+            kb.button(
+                text="🗑 Удалить вопрос",
+                callback_data=f"delete_question:{q.id}"
+            )
+
         kb.adjust(1)
 
     await callback.answer()
@@ -1984,6 +2016,145 @@ async def admin_view_question(
             + ("\n\n🔐 Тест уже опубликован, редактирование закрыто" if test.approved else "")
         ),
         reply_markup=kb.as_markup() if not test.approved else None
+    )
+
+
+@dp.callback_query(F.data.startswith("delete_question:"))
+async def delete_question_start(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "Удалять вопросы может только администратор",
+            show_alert=True,
+        )
+        return
+
+    question_id = int(callback.data.split(":", 1)[1])
+    async with async_session() as session:
+        result = await session.execute(
+            select(Question, Test)
+            .join(Test, Test.id == Question.test_id)
+            .where(Question.id == question_id)
+        )
+        row = result.first()
+
+    if not row:
+        await callback.answer("Вопрос не найден", show_alert=True)
+        return
+
+    question, test = row
+    if test.approved:
+        await callback.answer(
+            "Опубликованный тест изменять нельзя",
+            show_alert=True,
+        )
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="✅ Да, удалить",
+        callback_data=f"delete_question_confirm:{question.id}",
+    )
+    kb.button(
+        text="❌ Отмена",
+        callback_data=f"delete_question_cancel:{question.id}",
+    )
+    kb.adjust(1)
+
+    await callback.answer()
+    await callback.message.delete()
+    await callback.message.answer(
+        f"⚠️ Удалить вопрос №{question.question_order}?\n\n"
+        "После удаления оставшиеся вопросы будут перенумерованы.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(F.data.startswith("delete_question_cancel:"))
+async def delete_question_cancel(callback: CallbackQuery):
+    await callback.answer("Удаление отменено")
+    await callback.message.delete()
+
+
+@dp.callback_query(F.data.startswith("delete_question_confirm:"))
+async def delete_question_confirm(callback: CallbackQuery):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer(
+            "Удалять вопросы может только администратор",
+            show_alert=True,
+        )
+        return
+
+    question_id = int(callback.data.split(":", 1)[1])
+
+    async with async_session() as session:
+        result = await session.execute(
+            select(Question, Test)
+            .join(Test, Test.id == Question.test_id)
+            .where(Question.id == question_id)
+        )
+        row = result.first()
+
+        if not row:
+            await callback.answer("Вопрос уже удалён", show_alert=True)
+            return
+
+        question, test = row
+        if test.approved:
+            await callback.answer(
+                "Опубликованный тест изменять нельзя",
+                show_alert=True,
+            )
+            return
+
+        answers_count_result = await session.execute(
+            select(func.count(Answer.id)).where(
+                Answer.question_id == question.id
+            )
+        )
+        if answers_count_result.scalar_one() > 0:
+            await callback.answer(
+                "Вопрос уже использовался в ответах и не может быть удалён",
+                show_alert=True,
+            )
+            return
+
+        test_type = question.test_type
+        questions_result = await session.execute(
+            select(Question)
+            .where(
+                Question.test_id == question.test_id,
+                Question.test_type == test_type,
+            )
+            .order_by(Question.question_order)
+        )
+        questions = questions_result.scalars().all()
+
+        session.delete(question)
+        await session.flush()
+
+        remaining_questions = [item for item in questions if item.id != question.id]
+        # Сначала используем временные отрицательные номера, чтобы не нарушить
+        # уникальность (test_id, test_type, question_order) при перенумерации.
+        for item in remaining_questions:
+            item.question_order = -item.id
+        await session.flush()
+        for order, item in enumerate(remaining_questions, start=1):
+            item.question_order = order
+
+        await session.commit()
+
+    await callback.answer("Вопрос удалён")
+    await callback.message.delete()
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="👀 Вернуться к вопросам",
+        callback_data=f"view_test_type:{test_type}",
+    )
+    await callback.message.answer(
+        f"✅ Вопрос №{question.question_order} удалён.\n"
+        "Оставшиеся вопросы перенумерованы.",
+        reply_markup=kb.as_markup(),
     )
 
 
@@ -2347,8 +2518,8 @@ async def handle_stats_by_employee(callback: CallbackQuery):
 
     kb = InlineKeyboardBuilder()
     for employee in employees:
-        employee_name = escape(employee.full_name or "Без имени")
-        employee_city = escape(employee.city or "Без города")
+        employee_name = employee.full_name or "Без имени"
+        employee_city = employee.city or "Без города"
         kb.button(
             text=f"{employee_name} — {employee_city}",
             callback_data=f"stats_employee:{employee.id}",
@@ -2373,7 +2544,22 @@ async def handle_stats_employee(callback: CallbackQuery):
 
     today = date.today()
     month_start = today.replace(day=1)
-    daily_stats = defaultdict(lambda: {"total": 0, "correct": 0, "attempts": 0})
+    daily_stats = defaultdict(
+        lambda: {
+            "total": 0,
+            "correct": 0,
+            "attempts": 0,
+            "types": defaultdict(
+                lambda: {
+                    "total": 0,
+                    "correct": 0,
+                    "attempts": 0,
+                    "started_at": None,
+                    "completed_at": None,
+                }
+            ),
+        }
+    )
 
     async with async_session() as session:
         employee_result = await session.execute(
@@ -2395,6 +2581,19 @@ async def handle_stats_employee(callback: CallbackQuery):
         for test_session, test in sessions_result.all():
             day_stats = daily_stats[test.test_date]
             day_stats["attempts"] += test_session.attempts or 1
+            type_stats = day_stats["types"][test_session.test_type]
+            type_stats["attempts"] += test_session.attempts or 1
+
+            if (
+                type_stats["started_at"] is None
+                or test_session.started_at < type_stats["started_at"]
+            ):
+                type_stats["started_at"] = test_session.started_at
+            if test_session.completed_at and (
+                type_stats["completed_at"] is None
+                or test_session.completed_at > type_stats["completed_at"]
+            ):
+                type_stats["completed_at"] = test_session.completed_at
 
             attempts_result = await session.execute(
                 select(TestAttempt)
@@ -2409,6 +2608,10 @@ async def handle_stats_employee(callback: CallbackQuery):
                 answers = answers_result.scalars().all()
                 day_stats["total"] += len(answers)
                 day_stats["correct"] += sum(
+                    int(answer.is_correct) for answer in answers
+                )
+                type_stats["total"] += len(answers)
+                type_stats["correct"] += sum(
                     int(answer.is_correct) for answer in answers
                 )
 
@@ -2428,12 +2631,37 @@ async def handle_stats_employee(callback: CallbackQuery):
         if stats and stats["total"]:
             accuracy = stats["correct"] / stats["total"] * 100
             errors = stats["total"] - stats["correct"]
+            text += f"📌 {current_day.strftime('%d.%m.%Y')}\n"
             text += (
-                f"📌 {current_day.strftime('%d.%m.%Y')}: "
-                f"точность {accuracy:.0f}%, "
-                f"ошибок {errors}, "
-                f"попыток {stats['attempts']}\n"
+                f"   Итого: точность {accuracy:.0f}%, "
+                f"ошибок {errors}, попыток {stats['attempts']}\n"
             )
+            for test_type, type_label, type_icon in (
+                ("control", "Контроль", "📋"),
+                ("experience", "Опыт", "🧪"),
+            ):
+                type_stats = stats["types"].get(test_type)
+                if not type_stats or not type_stats["total"]:
+                    continue
+
+                type_accuracy = (
+                    type_stats["correct"] / type_stats["total"] * 100
+                )
+                type_errors = type_stats["total"] - type_stats["correct"]
+                started_at = to_astana_time(type_stats["started_at"])
+                completed_at = to_astana_time(type_stats["completed_at"])
+                started_label = started_at.strftime("%H:%M") if started_at else "—"
+                completed_label = (
+                    completed_at.strftime("%H:%M") if completed_at else "не завершён"
+                )
+                text += (
+                    f"   {type_icon} {type_label}: "
+                    f"{started_label}–{completed_label}, "
+                    f"{format_duration(type_stats['started_at'], type_stats['completed_at'])}\n"
+                    f"      точность {type_accuracy:.0f}%, "
+                    f"ошибок {type_errors}, "
+                    f"попыток {type_stats['attempts']}\n"
+                )
             active_days.append((current_day, accuracy, errors, stats["attempts"]))
         else:
             text += f"📌 {current_day.strftime('%d.%m.%Y')}: нет прохождения\n"
