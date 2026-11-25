@@ -49,6 +49,8 @@ from sqlalchemy import (
     func,
     text,
     select,
+    delete as sqlalchemy_delete,
+    update as sqlalchemy_update,
 )
 
 from sqlalchemy.ext.asyncio import (
@@ -1976,14 +1978,20 @@ async def admin_view_question(
             )
         )
 
-        q = result.scalar_one()
+        q = result.scalar_one_or_none()
+        if q is None:
+            await callback.answer("Вопрос уже удалён", show_alert=True)
+            return
 
         test_result = await session.execute(
             select(Test).where(
                 Test.id == q.test_id
             )
         )
-        test = test_result.scalar_one()
+        test = test_result.scalar_one_or_none()
+        if test is None:
+            await callback.answer("Тест не найден", show_alert=True)
+            return
 
     kb = InlineKeyboardBuilder()
 
@@ -2129,17 +2137,31 @@ async def delete_question_confirm(callback: CallbackQuery):
         )
         questions = questions_result.scalars().all()
 
-        await session.delete(question)
-        await session.flush()
-
+        deleted_order = question.question_order
         remaining_questions = [item for item in questions if item.id != question.id]
-        # Сначала используем временные отрицательные номера, чтобы не нарушить
-        # уникальность (test_id, test_type, question_order) при перенумерации.
+
+        # Выполняем удаление и перенумерацию отдельными SQL-операциями. Это
+        # гарантирует, что PostgreSQL не соберёт изменения ORM в один пакет и
+        # не увидит временный конфликт уникальных question_order.
+        await session.execute(
+            sqlalchemy_delete(Question).where(Question.id == question.id)
+        )
+
+        # Сначала освобождаем все постоянные номера временными отрицательными.
         for item in remaining_questions:
-            item.question_order = -item.id
-        await session.flush()
+            await session.execute(
+                sqlalchemy_update(Question)
+                .where(Question.id == item.id)
+                .values(question_order=-item.id)
+            )
+
+        # Затем назначаем последовательные номера по одному запросу.
         for order, item in enumerate(remaining_questions, start=1):
-            item.question_order = order
+            await session.execute(
+                sqlalchemy_update(Question)
+                .where(Question.id == item.id)
+                .values(question_order=order)
+            )
 
         await session.commit()
 
@@ -2152,7 +2174,7 @@ async def delete_question_confirm(callback: CallbackQuery):
         callback_data=f"view_test_type:{test_type}",
     )
     await callback.message.answer(
-        f"✅ Вопрос №{question.question_order} удалён.\n"
+        f"✅ Вопрос №{deleted_order} удалён.\n"
         "Оставшиеся вопросы перенумерованы.",
         reply_markup=kb.as_markup(),
     )
