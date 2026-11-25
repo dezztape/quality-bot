@@ -2129,7 +2129,7 @@ async def delete_question_confirm(callback: CallbackQuery):
         )
         questions = questions_result.scalars().all()
 
-        session.delete(question)
+        await session.delete(question)
         await session.flush()
 
         remaining_questions = [item for item in questions if item.id != question.id]
